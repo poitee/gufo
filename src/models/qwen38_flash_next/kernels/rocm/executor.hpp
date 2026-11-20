@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -591,6 +592,31 @@ private:
   bool Run(Session& session, std::uint64_t key, bool graph,
            const std::function<bool()>& body, std::string* error_msg,
            bool synchronize = true) const;
+  struct BatchGraphKey {
+    std::uint8_t kind{0};
+    std::uint8_t count{0};
+    std::uint32_t flags{0};
+    std::array<const Session*, 8> sessions{};
+    std::array<std::uint8_t, 8> tokens{};
+    bool operator==(const BatchGraphKey&) const noexcept = default;
+  };
+  struct BatchGraphKeyHash {
+    std::size_t operator()(const BatchGraphKey& k) const noexcept {
+      std::size_t h = std::size_t{k.kind} | (std::size_t{k.count} << 8) |
+                      (std::size_t{k.flags} << 16);
+      for (std::uint8_t i = 0; i < k.count; ++i) {
+        h ^= std::hash<const Session*>{}(k.sessions[i]) +
+             0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= std::size_t{k.tokens[i]} + 0x9e3779b97f4a7c15ULL + (h << 6) +
+             (h >> 2);
+      }
+      return h;
+    }
+  };
+  bool RunBatchGraph(const BatchGraphKey& key, bool enable_graph,
+                     const std::function<bool()>& body, std::string* error,
+                     bool synchronize = true) const;
+  void InvalidateBatchGraphs() const noexcept;
 
   const DeviceModel* model_{nullptr};
   NgramTable* ngram_{nullptr};
@@ -712,9 +738,14 @@ private:
   static constexpr std::size_t kCompactPenaltyLimit = 4096;
   std::uint32_t* verification_ids_{nullptr};
   std::uint32_t* verification_scratch_ids_{nullptr};
+  std::uint32_t* verification_allowed_masks_{nullptr};
+  std::uint32_t* verification_allowed_masks_host_{nullptr};
   sampling::LogitCandidate* verification_candidates_{nullptr};
   sampling::LogitCandidate* verification_candidates_host_{nullptr};
   mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
+  mutable std::unordered_map<BatchGraphKey, hipGraphExec_t, BatchGraphKeyHash>
+      batch_graphs_;
+  mutable std::unordered_set<BatchGraphKey, BatchGraphKeyHash> batch_warmed_;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};

@@ -515,6 +515,24 @@ bool SamplerState::NeedsConstraintMask() const {
   return constraint_restricts_;
 }
 
+bool SamplerState::AllowsToken(TokenId token) const {
+  if (const auto forced = ForcedToken())
+    return token == *forced;
+  if (!config_.constraint)
+    return true;
+  if (constraint_mask_)
+    return token < constraint_mask_->size() && (*constraint_mask_)[token] != 0;
+  return token < config_.constraint->vocabulary->size() &&
+         config_.constraint->vocabulary->Allows(*config_.constraint->grammar,
+                                                constraint_state_, token);
+}
+
+std::shared_ptr<const TokenBitmask> SamplerState::ConstraintBitmask() const {
+  if (!config_.constraint || ForcedToken())
+    return nullptr;
+  return config_.constraint->AllowedBitmask(constraint_state_);
+}
+
 std::vector<float> SamplerState::ConstrainedLogits(
     std::span<const float> logits, std::span<const TokenId> ids) const {
   const auto mask = config_.constraint->Allowed(constraint_state_);

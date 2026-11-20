@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
@@ -583,8 +585,270 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
                  "strix-q4k-mtp: %zu dense copies, %zu expert tensors, %zu MiB\n",
                  dense_copies, expert_tensors, total_bytes >> 20);
   }
+  if (const char* moe_down = std::getenv("GUFO_STRIX_MOE_DOWN");
+      moe_down != nullptr && moe_down[0] != '\0' && moe_down[0] != '0') {
+    const bool to_mxfp4 = std::strncmp(moe_down, "mxfp4", 5) == 0;
+    const bool to_iq4nl = std::strncmp(moe_down, "iq4_nl", 6) == 0;
+    const bool only_q5 = std::strstr(moe_down, "_q5") != nullptr;
+    if (!to_mxfp4 && !to_iq4nl) {
+      if (error_msg != nullptr)
+        *error_msg = "invalid GUFO_STRIX_MOE_DOWN: " + std::string(moe_down);
+      return nullptr;
+    }
+    const core::GgmlType dst_type =
+        to_mxfp4 ? core::GgmlType::kMXFP4 : core::GgmlType::kIQ4_NL;
+    const std::size_t dst_block_bytes = to_mxfp4 ? 17 : 18;
+    std::size_t converted_layers = 0;
+    std::size_t freed_bytes = 0;
+    std::size_t new_bytes = 0;
+    for (auto& l : m->layers_) {
+      auto& t = l.ffn_down_exps;
+      if (t.empty() || t.cols % 32 != 0 || t.experts == 0)
+        continue;
+      if (only_q5 && t.type != core::GgmlType::kQ5_1)
+        continue;
+      if (!only_q5 && t.type != core::GgmlType::kQ5_1 &&
+          t.type != core::GgmlType::kQ8_0)
+        continue;
+      const std::size_t total_rows = std::size_t{t.experts} * t.rows;
+      const std::size_t old_block_bytes =
+          t.type == core::GgmlType::kQ8_0 ? 34 : 24;
+      const std::size_t old_alloc_bytes =
+          total_rows * (t.cols / 32) * old_block_bytes + kTailMargin;
+      const std::size_t dst_size =
+          total_rows * (t.cols / 32) * dst_block_bytes;
+      void* dst = nullptr;
+      if (weights.Allocate(&dst, dst_size + kTailMargin) != hipSuccess) {
+        if (error_msg != nullptr)
+          *error_msg = "MoE down 4-bit conversion allocation failed";
+        return nullptr;
+      }
+      if (to_mxfp4)
+        QuantizeExpsToMXFP4(t.data, t.type, dst, total_rows, t.cols, nullptr);
+      else
+        QuantizeExpsToIQ4NL(t.data, t.type, dst, total_rows, t.cols, nullptr);
+      (void)hipMemsetAsync(static_cast<std::uint8_t*>(dst) + dst_size, 0,
+                           kTailMargin, nullptr);
+      if (hipDeviceSynchronize() != hipSuccess) {
+        (void)hipFree(dst);
+        if (error_msg != nullptr)
+          *error_msg = "MoE down 4-bit conversion failed";
+        return nullptr;
+      }
+      void* old_ptr = t.data;
+      std::erase(m->allocations_, old_ptr);
+      (void)hipFree(old_ptr);
+      m->allocations_.push_back(dst);
+      m->bytes_ -= old_alloc_bytes;
+      m->bytes_ += dst_size + kTailMargin;
+      t.data = dst;
+      t.type = dst_type;
+      ++converted_layers;
+      freed_bytes += old_alloc_bytes;
+      new_bytes += dst_size + kTailMargin;
+    }
+    std::fprintf(stderr, "strix-moe-down: %zu layers -> %s (saved %zu MiB)\n",
+                 converted_layers, to_mxfp4 ? "MXFP4" : "IQ4_NL",
+                 (freed_bytes - new_bytes) >> 20);
+  }
   if (const char* selftest = std::getenv("GUFO_STRIX_Q4K_SELFTEST");
       selftest != nullptr && selftest[0] != '\0' && selftest[0] != '0') {
+    const auto run_4bit_selftest = [&]() -> bool {
+      struct Q5_1BlockHost {
+        std::uint16_t d;
+        std::uint16_t m;
+        std::uint32_t qh;
+        std::uint8_t qs[16];
+      };
+      struct Iq4NlBlockHost {
+        std::uint16_t d;
+        std::uint8_t qs[16];
+      };
+      struct Mxfp4BlockHost {
+        std::uint8_t e;
+        std::uint8_t qs[16];
+      };
+      static constexpr std::int8_t kMxfp4Table[16] = {
+          0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+      };
+      const auto e8m0_to_f32 = [](std::uint8_t e) -> float {
+        const std::uint32_t bits =
+            e == 0 ? 0x00400000U : (static_cast<std::uint32_t>(e) << 23U);
+        float f = 0.0f;
+        std::memcpy(&f, &bits, sizeof(float));
+        return f;
+      };
+      constexpr int M = 64;
+      constexpr int K = 640;
+      constexpr int E = 4;
+      constexpr int B = K / 32;
+      constexpr int T_max = 40;
+      const std::size_t q5_bytes = std::size_t{E} * M * B * sizeof(Q5_1BlockHost);
+      const std::size_t iq4_bytes =
+          std::size_t{E} * M * B * sizeof(Iq4NlBlockHost);
+      const std::size_t mx_bytes =
+          std::size_t{E} * M * B * sizeof(Mxfp4BlockHost);
+      std::vector<Q5_1BlockHost> h_q5(E * M * B);
+      constexpr std::uint16_t kDs[4] = {0x3000, 0x2C00, 0xB000, 0x3400};
+      constexpr std::uint16_t kMs[4] = {0xB800, 0xB400, 0x3400, 0x0000};
+      for (int idx = 0; idx < E * M * B; ++idx) {
+        auto& blk = h_q5[idx];
+        blk.d = kDs[idx & 3];
+        blk.m = kMs[(idx >> 2) & 3];
+        blk.qh = static_cast<std::uint32_t>(idx * 2654435761U);
+        for (int j = 0; j < 16; ++j)
+          blk.qs[j] = static_cast<std::uint8_t>((idx * 17 + j * 31) & 0xFF);
+      }
+      // Exact Q8_1-representable inputs (block scale = 1/128 = 0x2000).
+      std::vector<float> h_x(std::size_t{T_max} * K);
+      for (int t = 0; t < T_max; ++t) {
+        for (int b = 0; b < B; ++b) {
+          h_x[std::size_t{t} * K + b * 32 + 0] = 127.0f * 0.0078125f;
+          for (int i = 1; i < 32; ++i) {
+            const int q = ((i * 7 + b * 13 + t * 19) % 121) - 60;
+            h_x[std::size_t{t} * K + b * 32 + i] =
+                static_cast<float>(q) * 0.0078125f;
+          }
+        }
+      }
+      std::vector<std::int32_t> h_ids(T_max);
+      for (int t = 0; t < T_max; ++t)
+        h_ids[t] = (t * 3 + (t / 4)) % E;
+
+      void* d_q5 = nullptr;
+      void* d_iq4 = nullptr;
+      void* d_mx = nullptr;
+      float* d_x = nullptr;
+      std::int32_t* d_ids = nullptr;
+      float* d_out = nullptr;
+      const auto cleanup = [&]() {
+        if (d_q5) (void)hipFree(d_q5);
+        if (d_iq4) (void)hipFree(d_iq4);
+        if (d_mx) (void)hipFree(d_mx);
+        if (d_x) (void)hipFree(d_x);
+        if (d_ids) (void)hipFree(d_ids);
+        if (d_out) (void)hipFree(d_out);
+      };
+      if (hip::AllocateDevice(&d_q5, q5_bytes + kTailMargin) != hipSuccess ||
+          hip::AllocateDevice(&d_iq4, iq4_bytes + kTailMargin) != hipSuccess ||
+          hip::AllocateDevice(&d_mx, mx_bytes + kTailMargin) != hipSuccess ||
+          hip::AllocateDevice(&d_x, h_x.size() * sizeof(float)) != hipSuccess ||
+          hip::AllocateDevice(&d_ids, T_max * sizeof(std::int32_t)) !=
+              hipSuccess ||
+          hip::AllocateDevice(&d_out, std::size_t{T_max} * M * sizeof(float)) !=
+              hipSuccess) {
+        cleanup();
+        return false;
+      }
+      bool ok =
+          hipMemcpyAsync(d_q5, h_q5.data(), q5_bytes, hipMemcpyHostToDevice,
+                         nullptr) == hipSuccess &&
+          hipMemsetAsync(static_cast<std::uint8_t*>(d_iq4) + iq4_bytes, 0,
+                         kTailMargin, nullptr) == hipSuccess &&
+          hipMemsetAsync(static_cast<std::uint8_t*>(d_mx) + mx_bytes, 0,
+                         kTailMargin, nullptr) == hipSuccess &&
+          hipMemcpyAsync(d_x, h_x.data(), h_x.size() * sizeof(float),
+                         hipMemcpyHostToDevice, nullptr) == hipSuccess &&
+          hipMemcpyAsync(d_ids, h_ids.data(), T_max * sizeof(std::int32_t),
+                         hipMemcpyHostToDevice, nullptr) == hipSuccess;
+      std::vector<Iq4NlBlockHost> h_iq4(E * M * B);
+      std::vector<Mxfp4BlockHost> h_mx(E * M * B);
+      if (ok) {
+        QuantizeExpsToIQ4NL(d_q5, core::GgmlType::kQ5_1, d_iq4, E * M, K,
+                            nullptr);
+        QuantizeExpsToMXFP4(d_q5, core::GgmlType::kQ5_1, d_mx, E * M, K,
+                            nullptr);
+        ok = hipGetLastError() == hipSuccess &&
+             hipMemcpyAsync(h_iq4.data(), d_iq4, iq4_bytes,
+                            hipMemcpyDeviceToHost, nullptr) == hipSuccess &&
+             hipMemcpyAsync(h_mx.data(), d_mx, mx_bytes, hipMemcpyDeviceToHost,
+                            nullptr) == hipSuccess &&
+             hipDeviceSynchronize() == hipSuccess;
+      }
+      const auto run_format = [&](bool mxfp4, int tokens, bool raw,
+                                  double& max_err) -> bool {
+        max_err = 0.0;
+        const int type_id = static_cast<int>(
+            mxfp4 ? core::GgmlType::kMXFP4 : core::GgmlType::kIQ4_NL);
+        const void* w_dev = mxfp4 ? d_mx : d_iq4;
+        if (hipMemsetAsync(d_out, 0, std::size_t{tokens} * M * sizeof(float),
+                           nullptr) != hipSuccess)
+          return false;
+        const int rc =
+            raw ? (mxfp4 ? qfn_mmq_mxfp4_moe_raw(w_dev, d_x, d_ids, d_out, M, K,
+                                                 tokens, E, 1, nullptr)
+                         : qfn_mmq_iq4_nl_moe_raw(w_dev, d_x, d_ids, d_out, M,
+                                                  K, tokens, E, 1, nullptr))
+                : qfn_mmq_moe_vec(type_id, w_dev, d_x, d_ids, d_out, M, K,
+                                  tokens, E, 1, nullptr);
+        if (rc != 0)
+          return false;
+        std::vector<float> h_out(std::size_t{tokens} * M);
+        if (hipMemcpyAsync(h_out.data(), d_out, h_out.size() * sizeof(float),
+                           hipMemcpyDeviceToHost, nullptr) != hipSuccess ||
+            hipDeviceSynchronize() != hipSuccess)
+          return false;
+        for (int t = 0; t < tokens; ++t) {
+          const int e = h_ids[t];
+          for (int r = 0; r < M; ++r) {
+            double ref = 0.0;
+            for (int b = 0; b < B; ++b) {
+              const int bidx = (e * M + r) * B + b;
+              const float* xp = &h_x[std::size_t{t} * K + b * 32];
+              if (mxfp4) {
+                const auto& blk = h_mx[bidx];
+                const double scale =
+                    static_cast<double>(e8m0_to_f32(blk.e)) * 0.5;
+                for (int j = 0; j < 16; ++j) {
+                  const int q0 = blk.qs[j] & 0x0F;
+                  const int q1 = blk.qs[j] >> 4;
+                  ref += scale * kMxfp4Table[q0] * xp[j];
+                  ref += scale * kMxfp4Table[q1] * xp[j + 16];
+                }
+              } else {
+                const auto& blk = h_iq4[bidx];
+                const double scale =
+                    static_cast<double>(gufo::quant::Fp16ToFloat(blk.d));
+                for (int j = 0; j < 16; ++j) {
+                  const int q0 = blk.qs[j] & 0x0F;
+                  const int q1 = blk.qs[j] >> 4;
+                  ref += scale * gufo::quant::kValuesIq4Nl[q0] * xp[j];
+                  ref += scale * gufo::quant::kValuesIq4Nl[q1] * xp[j + 16];
+                }
+              }
+            }
+            const float got = h_out[std::size_t{t} * M + r];
+            if (!std::isfinite(got))
+              return false;
+            const double err =
+                ref > got ? (ref - got) : (static_cast<double>(got) - ref);
+            if (err > max_err)
+              max_err = err;
+          }
+        }
+        return true;
+      };
+      double e_iq2 = 0, e_iq24 = 0, e_iq40 = 0;
+      double e_mx2 = 0, e_mx24 = 0, e_mx40 = 0;
+      ok = ok && run_format(false, 2, false, e_iq2) &&
+           run_format(false, 24, false, e_iq24) &&
+           run_format(false, 40, true, e_iq40) &&
+           run_format(true, 2, false, e_mx2) &&
+           run_format(true, 24, false, e_mx24) &&
+           run_format(true, 40, true, e_mx40);
+      cleanup();
+      std::fprintf(stderr,
+                   "strix-moe-4bit-selftest: iq4_vec2=%.3e iq4_vec24=%.3e "
+                   "iq4_mmq40=%.3e mx_vec2=%.3e mx_vec24=%.3e mx_mmq40=%.3e\n",
+                   e_iq2, e_iq24, e_iq40, e_mx2, e_mx24, e_mx40);
+      return ok && e_iq2 < 1e-4 && e_iq24 < 1e-4 && e_iq40 < 5e-3 &&
+             e_mx2 < 1e-4 && e_mx24 < 1e-4 && e_mx40 < 5e-3;
+    };
+    if (!run_4bit_selftest()) {
+      if (error_msg != nullptr)
+        *error_msg = "MoE down 4-bit selftest failed";
+      return nullptr;
+    }
     const DeviceTensor* probe = nullptr;
     const DeviceTensor* hc_probe = nullptr;
     const auto check_probe = [&](const DeviceTensor& t) {

@@ -609,7 +609,10 @@ void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
 void VerificationCandidates(const float* logits, GreedyPenaltyRows penalties,
                             std::uint32_t* ids, std::uint32_t* scratch_ids,
                             sampling::LogitCandidate* out, std::uint32_t rows,
-                            std::uint32_t vocab, hipStream_t stream);
+                            std::uint32_t vocab, hipStream_t stream,
+                            const std::uint32_t* allowed_masks = nullptr,
+                            std::uint32_t mask_stride = 0,
+                            std::uint32_t mask_active = 0);
 
 /// Draft logits of empty table slots (table[i] < 0) become -infinity.
 void MaskDraftLogits(float* logits, const std::int32_t* table, std::uint32_t n,
@@ -644,6 +647,15 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
 /// arithmetic on the dequantized values.
 void QuantizeQ8_0ToQ4K(const void* q8, void* q4k, std::size_t rows,
                        std::uint32_t cols, hipStream_t stream);
+
+/// Requantizes Q5_1 or Q8_0 rows of `cols` (a multiple of 32) weights on GPU
+/// into GGML IQ4_NL or Blackwell MXFP4 blocks.
+void QuantizeExpsToIQ4NL(const void* src, core::GgmlType src_type, void* dst,
+                         std::size_t rows, std::uint32_t cols,
+                         hipStream_t stream);
+void QuantizeExpsToMXFP4(const void* src, core::GgmlType src_type, void* dst,
+                         std::size_t rows, std::uint32_t cols,
+                         hipStream_t stream);
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 

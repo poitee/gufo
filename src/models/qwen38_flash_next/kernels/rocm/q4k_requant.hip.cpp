@@ -24,6 +24,35 @@ struct Q8_0Block {
 };
 static_assert(sizeof(Q8_0Block) == 34, "block_q8_0 must be 34 bytes");
 
+struct Q5_1Block {
+  __half d;
+  __half m;
+  std::uint32_t qh;
+  std::uint8_t qs[16];
+};
+static_assert(sizeof(Q5_1Block) == 24, "block_q5_1 must be 24 bytes");
+
+struct Iq4NlBlock {
+  __half d;
+  std::uint8_t qs[16];
+};
+static_assert(sizeof(Iq4NlBlock) == 18, "block_iq4_nl must be 18 bytes");
+
+struct Mxfp4Block {
+  std::uint8_t e;
+  std::uint8_t qs[16];
+};
+static_assert(sizeof(Mxfp4Block) == 17, "block_mxfp4 must be 17 bytes");
+
+constexpr std::int8_t kIq4NlValues[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+    1,    13,   25,  38,  53,  69,  89,  113,
+};
+
+constexpr std::int8_t kMxfp4Values[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+
 struct Q4KBlock {
   __half d;
   __half dmin;
@@ -207,6 +236,188 @@ __global__ void QuantizeQ8_0ToQ4KKernel(const Q8_0Block* __restrict__ q8,
   }
 }
 
+void QuantizeQ8_0ToQ4K(const void* q8, void* q4k, std::size_t rows,
+                       std::uint32_t cols, hipStream_t stream);
+
+__device__ __forceinline__ float E8m0ToFp32(std::uint8_t x) {
+  const std::uint32_t bits =
+      (x == 0) ? 0x00400000U : (static_cast<std::uint32_t>(x) << 23U);
+  return __uint_as_float(bits);
+}
+
+template<bool kFromQ8>
+__device__ void DequantizeSourceBlock32(const void* src, std::size_t block_idx,
+                                        float (&x)[32]) {
+  if constexpr (kFromQ8) {
+    const auto& b = static_cast<const Q8_0Block*>(src)[block_idx];
+    const float d = __half2float(b.d);
+#pragma unroll
+    for (int i = 0; i < 32; ++i)
+      x[i] = d * static_cast<float>(b.qs[i]);
+  } else {
+    const auto& b = static_cast<const Q5_1Block*>(src)[block_idx];
+    const float d = __half2float(b.d);
+    const float m = __half2float(b.m);
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      const std::uint8_t byte = b.qs[j];
+      const int q0 = (byte & 0x0F) | (((b.qh >> j) & 1U) << 4);
+      const int q1 = (byte >> 4) | (((b.qh >> (j + 16)) & 1U) << 4);
+      x[j] = d * static_cast<float>(q0) + m;
+      x[j + 16] = d * static_cast<float>(q1) + m;
+    }
+  }
+}
+
+__device__ void PackBlockToIQ4NL(const float (&x)[32], Iq4NlBlock& out) {
+  float amax = 0.0f;
+  float vmax = 0.0f;
+  for (int i = 0; i < 32; ++i) {
+    const float ax = fabsf(x[i]);
+    if (ax > amax) {
+      amax = ax;
+      vmax = x[i];
+    }
+  }
+  if (amax == 0.0f) {
+    out.d = __float2half_rn(0.0f);
+    for (int j = 0; j < 16; ++j)
+      out.qs[j] = 0;
+    return;
+  }
+  float d = vmax / -127.0f;
+  std::uint8_t codes[32];
+  for (int iter = 0; iter < 3; ++iter) {
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    float sum_xq = 0.0f;
+    float sum_qq = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+      const float target = x[i] * id;
+      int best_c = 0;
+      float best_err =
+          fabsf(target - static_cast<float>(kIq4NlValues[0]));
+      for (int c = 1; c < 16; ++c) {
+        const float err =
+            fabsf(target - static_cast<float>(kIq4NlValues[c]));
+        if (err < best_err) {
+          best_err = err;
+          best_c = c;
+        }
+      }
+      codes[i] = static_cast<std::uint8_t>(best_c);
+      const float kv = static_cast<float>(kIq4NlValues[best_c]);
+      sum_xq += x[i] * kv;
+      sum_qq += kv * kv;
+    }
+    if (sum_qq > 0.0f && sum_xq != 0.0f)
+      d = sum_xq / sum_qq;
+  }
+  const __half d16 = __float2half_rn(d);
+  const float df = __half2float(d16);
+  if (df == 0.0f) {
+    out.d = __float2half_rn(0.0f);
+    for (int j = 0; j < 16; ++j)
+      out.qs[j] = 0;
+    return;
+  }
+  for (int i = 0; i < 32; ++i) {
+    int best_c = 0;
+    float best_err =
+        fabsf(x[i] - df * static_cast<float>(kIq4NlValues[0]));
+    for (int c = 1; c < 16; ++c) {
+      const float err =
+          fabsf(x[i] - df * static_cast<float>(kIq4NlValues[c]));
+      if (err < best_err) {
+        best_err = err;
+        best_c = c;
+      }
+    }
+    codes[i] = static_cast<std::uint8_t>(best_c);
+  }
+  out.d = d16;
+  for (int j = 0; j < 16; ++j) {
+    out.qs[j] = static_cast<std::uint8_t>(codes[j] | (codes[j + 16] << 4));
+  }
+}
+
+__device__ void PackBlockToMXFP4(const float (&x)[32], Mxfp4Block& out) {
+  float amax = 0.0f;
+  for (int i = 0; i < 32; ++i) {
+    amax = fmaxf(amax, fabsf(x[i]));
+  }
+  if (amax == 0.0f) {
+    out.e = 0;
+    for (int j = 0; j < 16; ++j)
+      out.qs[j] = 0;
+    return;
+  }
+  // E8M0 scale e: effective scale in vec_dot_mxfp4 is E8m0ToFp32(e) * 0.5f,
+  // times integer LUT kMxfp4Values (max magnitude 12 -> E8m0 * 6.0f).
+  const float ratio = amax / 6.0f;
+  const int raw_exp =
+      static_cast<int>((__float_as_uint(ratio) >> 23U) & 0xFFU);
+  const int e_lo = max(1, min(254, raw_exp));
+  const int e_hi = min(254, e_lo + 1);
+  int best_e = e_lo;
+  float best_mse = 1e38f;
+  for (int e_cand = e_lo; e_cand <= e_hi; ++e_cand) {
+    const float df = E8m0ToFp32(static_cast<std::uint8_t>(e_cand)) * 0.5f;
+    float mse = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+      float best_sq = 1e38f;
+      for (int c = 0; c < 16; ++c) {
+        if (c == 8)
+          continue;  // duplicate -0 encoding
+        const float diff = x[i] - df * static_cast<float>(kMxfp4Values[c]);
+        best_sq = fminf(best_sq, diff * diff);
+      }
+      mse += best_sq;
+    }
+    if (mse < best_mse) {
+      best_mse = mse;
+      best_e = e_cand;
+    }
+  }
+  out.e = static_cast<std::uint8_t>(best_e);
+  const float df = E8m0ToFp32(out.e) * 0.5f;
+  std::uint8_t codes[32];
+  for (int i = 0; i < 32; ++i) {
+    int best_c = 0;
+    float best_err = fabsf(x[i]);
+    for (int c = 1; c < 16; ++c) {
+      if (c == 8)
+        continue;
+      const float err =
+          fabsf(x[i] - df * static_cast<float>(kMxfp4Values[c]));
+      if (err < best_err) {
+        best_err = err;
+        best_c = c;
+      }
+    }
+    codes[i] = static_cast<std::uint8_t>(best_c);
+  }
+  for (int j = 0; j < 16; ++j) {
+    out.qs[j] = static_cast<std::uint8_t>(codes[j] | (codes[j + 16] << 4));
+  }
+}
+
+template<bool kFromQ8, bool kToMxfp4>
+__global__ void QuantizeExpsTo4BitKernel(const void* __restrict__ src,
+                                         void* __restrict__ dst,
+                                         std::size_t blocks) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= blocks)
+    return;
+  float x[32];
+  DequantizeSourceBlock32<kFromQ8>(src, idx, x);
+  if constexpr (kToMxfp4) {
+    PackBlockToMXFP4(x, static_cast<Mxfp4Block*>(dst)[idx]);
+  } else {
+    PackBlockToIQ4NL(x, static_cast<Iq4NlBlock*>(dst)[idx]);
+  }
+}
+
 }  // namespace
 
 void QuantizeQ8_0ToQ4K(const void* q8, void* q4k, std::size_t rows,
@@ -218,6 +429,34 @@ void QuantizeQ8_0ToQ4K(const void* q8, void* q4k, std::size_t rows,
       dim3(static_cast<unsigned>((superblocks + kPerBlock - 1) / kPerBlock)),
       dim3(kThreads), 0, stream, static_cast<const Q8_0Block*>(q8),
       static_cast<Q4KBlock*>(q4k), superblocks);
+}
+
+void QuantizeExpsToIQ4NL(const void* src, core::GgmlType src_type, void* dst,
+                         std::size_t rows, std::uint32_t cols,
+                         hipStream_t stream) {
+  const std::size_t blocks = rows * (cols / 32);
+  const dim3 grid(static_cast<unsigned>((blocks + kThreads - 1) / kThreads));
+  if (src_type == core::GgmlType::kQ8_0) {
+    hipLaunchKernelGGL((QuantizeExpsTo4BitKernel<true, false>), grid,
+                       dim3(kThreads), 0, stream, src, dst, blocks);
+  } else {
+    hipLaunchKernelGGL((QuantizeExpsTo4BitKernel<false, false>), grid,
+                       dim3(kThreads), 0, stream, src, dst, blocks);
+  }
+}
+
+void QuantizeExpsToMXFP4(const void* src, core::GgmlType src_type, void* dst,
+                         std::size_t rows, std::uint32_t cols,
+                         hipStream_t stream) {
+  const std::size_t blocks = rows * (cols / 32);
+  const dim3 grid(static_cast<unsigned>((blocks + kThreads - 1) / kThreads));
+  if (src_type == core::GgmlType::kQ8_0) {
+    hipLaunchKernelGGL((QuantizeExpsTo4BitKernel<true, true>), grid,
+                       dim3(kThreads), 0, stream, src, dst, blocks);
+  } else {
+    hipLaunchKernelGGL((QuantizeExpsTo4BitKernel<false, true>), grid,
+                       dim3(kThreads), 0, stream, src, dst, blocks);
+  }
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

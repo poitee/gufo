@@ -36,6 +36,22 @@ bool WideBatchEnabled() noexcept {
   return enabled;
 }
 
+bool GpuGrammarMaskEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_GPU_GRAMMAR_MASK");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
+bool BatchGraphEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_BATCH_GRAPH");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
 void AssignError(std::string* error_msg, const std::string& message) {
   if (error_msg != nullptr) {
     *error_msg = message;
@@ -662,6 +678,8 @@ void Session::PreserveSnapshots(std::uint32_t position,
 }
 
 Session::~Session() {
+  if (owner_ != nullptr)
+    owner_->InvalidateBatchGraphs();
   try {
     PreserveSnapshots(0, 0);
   } catch (...) {
@@ -687,6 +705,8 @@ void Session::RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
   for (auto& attention : attention_)
     attention.rope = vision_input_.rope();
   if (previous != vision_input_.rope()) {
+    if (owner_ != nullptr)
+      owner_->InvalidateBatchGraphs();
     for (const auto& [key, graph] : graphs_)
       (void)hipGraphExecDestroy(graph);
     graphs_.clear();
@@ -710,6 +730,8 @@ void Session::ConfigureVision(
   for (auto& attention : attention_)
     attention.rope = vision_input_.rope();
   if (previous != vision_input_.rope()) {
+    if (owner_ != nullptr)
+      owner_->InvalidateBatchGraphs();
     for (const auto& [key, graph] : graphs_)
       (void)hipGraphExecDestroy(graph);
     graphs_.clear();
@@ -836,6 +858,8 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
 void Session::TrimRollback(std::uint32_t depth) noexcept {
   if (depth >= rollback_depth_)
     return;
+  if (owner_ != nullptr)
+    owner_->InvalidateBatchGraphs();
   // Keep graphs whose rows still exist. Deeper verifier graphs capture
   // discarded pointers; ordinary decode and MTP graphs do not.
   for (auto it = graphs_.begin(); it != graphs_.end();) {
@@ -904,12 +928,27 @@ void Session::Reset(bool reuse_mtp) {
   }
 }
 
+void Executor::InvalidateBatchGraphs() const noexcept {
+  if (batch_graphs_.empty() && batch_warmed_.empty())
+    return;
+  if (!batch_graphs_.empty()) {
+    if (stream_ != nullptr)
+      (void)hipStreamSynchronize(stream_);
+    for (auto& [key, exec] : batch_graphs_) {
+      (void)hipGraphExecDestroy(exec);
+    }
+    batch_graphs_.clear();
+  }
+  batch_warmed_.clear();
+}
+
 Executor::~Executor() {
   // Readers write pinned staging memory; drain them before freeing it,
   // including when a forward failed before reaching PLE.
   if (ple_pending_ || prefetch_.pending) {
     (void)ngram_->WaitRead();
   }
+  InvalidateBatchGraphs();
   (void)hipFree(batch_logits_);
   (void)hipFree(verification_penalties_);
   for (void* p : allocations_) {
@@ -1228,6 +1267,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
           a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
       e->verification_scratch_ids_ = Alloc<std::uint32_t>(
           a, rows * MtpCandidateWorkspaceSize(c.vocab_size), error_msg);
+      const auto mask_stride = (c.vocab_size + 31U) / 32U;
+      e->verification_allowed_masks_ =
+          Alloc<std::uint32_t>(a, rows * mask_stride, error_msg);
       const auto candidates = rows * (kMtpCandidates + kCompactPenaltyLimit);
       e->verification_candidates_ =
           Alloc<sampling::LogitCandidate>(a, candidates, error_msg);
@@ -1235,6 +1277,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                      &e->verification_candidates_host_,
                      candidates * sizeof(sampling::LogitCandidate)),
                  "pinned verification candidates", error_msg) ||
+          !Check(e->host_allocations_.Allocate(
+                     &e->verification_allowed_masks_host_,
+                     rows * mask_stride * sizeof(std::uint32_t)),
+                 "pinned verification constraint bitmask", error_msg) ||
           !Check(hip::AllocateDevice(&e->verification_penalties_,
                                      rows * kCompactPenaltyLimit *
                                          sizeof(sampling::TokenPenalty)),
@@ -1904,6 +1950,14 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
         break;
       case GgmlType::kQ8_0:
         rc = qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kIQ4_NL:
+        rc = qfn_mmq_iq4_nl_moe_raw(w.data, x, ids, out, M, K, T, E, U,
+                                    stream_);
+        break;
+      case GgmlType::kMXFP4:
+        rc = qfn_mmq_mxfp4_moe_raw(w.data, x, ids, out, M, K, T, E, U,
+                                   stream_);
         break;
       default:
         break;
@@ -2993,6 +3047,73 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
   }
   return !synchronize ||
          Check(hipStreamSynchronize(stream_), "forward", error_msg);
+}
+
+bool Executor::RunBatchGraph(const BatchGraphKey& key, bool enable_graph,
+                             const std::function<bool()>& body,
+                             std::string* error, bool synchronize) const {
+  if (!enable_graph) {
+    return body() &&
+           (!synchronize || Check(hipStreamSynchronize(stream_),
+                                  "batched forward", error));
+  }
+  if (batch_warmed_.contains(key)) {
+    hipGraphExec_t exec = nullptr;
+    bool enqueued = false;
+    if (const auto it = batch_graphs_.find(key); it != batch_graphs_.end()) {
+      exec = it->second;
+    } else {
+      if (batch_graphs_.size() >= 48) {
+        InvalidateBatchGraphs();
+        batch_warmed_.insert(key);
+      }
+      if (synchronize && key.kind == 2) {
+        auto dispatch = std::tie(
+            moe_pending_, defer_residual_, res_deferred_, shexp_half_ready_,
+            q8t_src_, q8t_rows_, q8t_cols_, half_src_, half_rows_, half_cols_,
+            half_bf16_, xn_half_, inject_parts_, inject_fused_, q8_slot_,
+            xn_q8_ready_, mixed_q8_ready_);
+        const auto before = std::apply(
+            [](const auto&... fields) { return std::make_tuple(fields...); },
+            dispatch);
+        if (!body())
+          return false;
+        dispatch = before;
+        enqueued = true;
+      }
+      hipGraph_t captured = nullptr;
+      if (!Check(
+              hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal),
+              "batch graph capture", error)) {
+        return false;
+      }
+      const bool ok = body();
+      if (!Check(hipStreamEndCapture(stream_, &captured),
+                 "batch graph capture end", error) ||
+          !ok) {
+        if (captured != nullptr)
+          (void)hipGraphDestroy(captured);
+        return false;
+      }
+      const bool instantiated =
+          Check(hipGraphInstantiate(&exec, captured, nullptr, nullptr, 0),
+                "batch graph instantiate", error);
+      (void)hipGraphDestroy(captured);
+      if (!instantiated)
+        return false;
+      batch_graphs_.emplace(key, exec);
+    }
+    if (!enqueued &&
+        !Check(hipGraphLaunch(exec, stream_), "batch graph launch", error)) {
+      return false;
+    }
+  } else {
+    if (!body())
+      return false;
+    batch_warmed_.insert(key);
+  }
+  return !synchronize ||
+         Check(hipStreamSynchronize(stream_), "batched forward", error);
 }
 
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
@@ -4264,13 +4385,68 @@ bool Executor::SampledMtpCandidates(
   auto& penalties = verification_penalty_host_;
   penalties.clear();
   GreedyPenaltyRows batch{};
-  auto tentative = sampler.WithoutConstraint();
-  for (std::size_t row = 0; row < rows; ++row) {
-    const auto counts = tentative.penalties();
-    penalties.insert(penalties.end(), counts.begin(), counts.end());
-    batch.offsets[row + 1] = penalties.size();
-    if (row + 1 < rows)
-      tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
+  std::uint32_t mask_stride = 0;
+  std::uint32_t mask_active = 0;
+  if (GpuGrammarMaskEnabled() && sampler.HasConstraint() &&
+      verification_allowed_masks_ != nullptr &&
+      verification_allowed_masks_host_ != nullptr) {
+    mask_stride = (config().vocab_size + 31U) / 32U;
+    auto tentative = sampler;
+    bool constraint_alive = true;
+    std::uint32_t active_rows = 0;
+    for (std::size_t row = 0; row < rows; ++row) {
+      const auto counts = tentative.penalties();
+      penalties.insert(penalties.end(), counts.begin(), counts.end());
+      batch.offsets[row + 1] = penalties.size();
+      if (constraint_alive && !tentative.ForcedToken()) {
+        if (const auto bm = tentative.ConstraintBitmask();
+            bm && bm->restricts) {
+          auto* dst = verification_allowed_masks_host_ + row * mask_stride;
+          const auto copy_words =
+              std::min<std::size_t>(bm->words.size(), mask_stride);
+          std::memcpy(dst, bm->words.data(),
+                      copy_words * sizeof(std::uint32_t));
+          if (copy_words < mask_stride) {
+            std::memset(dst + copy_words, 0,
+                        (mask_stride - copy_words) * sizeof(std::uint32_t));
+          }
+          mask_active |= (std::uint32_t{1} << row);
+          active_rows = static_cast<std::uint32_t>(row + 1);
+        }
+      }
+      if (row + 1 < rows) {
+        const auto draft = static_cast<sampling::TokenId>(drafts[row]);
+        if (constraint_alive) {
+          if (tentative.AllowsToken(draft)) {
+            tentative.Accept(draft);
+          } else {
+            constraint_alive = false;
+            tentative = tentative.WithoutConstraint();
+            tentative.Accept(draft);
+          }
+        } else {
+          tentative.Accept(draft);
+        }
+      }
+    }
+    if (mask_active != 0 &&
+        !Check(hipMemcpyAsync(
+                   verification_allowed_masks_,
+                   verification_allowed_masks_host_,
+                   std::size_t{active_rows} * mask_stride *
+                       sizeof(std::uint32_t),
+                   hipMemcpyHostToDevice, stream_),
+               "verification constraint bitmask", error_msg))
+      return false;
+  } else {
+    auto tentative = sampler.WithoutConstraint();
+    for (std::size_t row = 0; row < rows; ++row) {
+      const auto counts = tentative.penalties();
+      penalties.insert(penalties.end(), counts.begin(), counts.end());
+      batch.offsets[row + 1] = penalties.size();
+      if (row + 1 < rows)
+        tentative.Accept(static_cast<sampling::TokenId>(drafts[row]));
+    }
   }
   batch.penalties = verification_penalties_;
   if (!penalties.empty() &&
@@ -4279,9 +4455,11 @@ bool Executor::SampledMtpCandidates(
                             hipMemcpyHostToDevice, stream_),
              "compact verification penalties", error_msg))
     return false;
-  VerificationCandidates(VerificationLogits(), batch, verification_ids_,
-                         verification_scratch_ids_, verification_candidates_,
-                         rows, config().vocab_size, stream_);
+  VerificationCandidates(
+      VerificationLogits(), batch, verification_ids_, verification_scratch_ids_,
+      verification_candidates_, rows, config().vocab_size, stream_,
+      mask_active ? verification_allowed_masks_ : nullptr, mask_stride,
+      mask_active);
   const auto count = rows * kMtpCandidates + penalties.size();
   const bool copied = Check(
       hipMemcpyAsync(verification_candidates_host_, verification_candidates_,

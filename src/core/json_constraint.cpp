@@ -2490,7 +2490,7 @@ bool ConstraintVocabulary::Allows(const JsonConstraint& grammar,
   return true;
 }
 
-std::shared_ptr<const std::vector<std::uint8_t>> TokenConstraint::Allowed(
+TokenConstraint::MaskEntry TokenConstraint::LookupOrBuild(
     const JsonConstraint::State& state) const {
   auto canonical =
       grammar->CanonicalMaskState(state, vocabulary->max_token_bytes_);
@@ -2502,8 +2502,17 @@ std::shared_ptr<const std::vector<std::uint8_t>> TokenConstraint::Allowed(
     if (const auto found = masks_.find(canonical); found != masks_.end())
       return found->second;
   }
-  auto mask = std::make_shared<const std::vector<std::uint8_t>>(
+  auto bytes = std::make_shared<std::vector<std::uint8_t>>(
       vocabulary->Allowed(*grammar, canonical));
+  auto bits = std::make_shared<TokenBitmask>();
+  bits->words.assign((bytes->size() + 31U) / 32U, 0U);
+  for (std::size_t i = 0; i < bytes->size(); ++i) {
+    if ((*bytes)[i] != 0)
+      bits->words[i >> 5] |= (std::uint32_t{1} << (i & 31U));
+    else
+      bits->restricts = true;
+  }
+  MaskEntry entry{std::move(bytes), std::move(bits)};
   const std::lock_guard lock(mutex_);
   if (const auto found = masks_.find(canonical); found != masks_.end())
     return found->second;
@@ -2516,6 +2525,16 @@ std::shared_ptr<const std::vector<std::uint8_t>> TokenConstraint::Allowed(
       ++victim;
     masks_.erase(victim);
   }
-  return masks_.emplace(std::move(canonical), std::move(mask)).first->second;
+  return masks_.emplace(std::move(canonical), std::move(entry)).first->second;
+}
+
+std::shared_ptr<const std::vector<std::uint8_t>> TokenConstraint::Allowed(
+    const JsonConstraint::State& state) const {
+  return LookupOrBuild(state).bytes;
+}
+
+std::shared_ptr<const TokenBitmask> TokenConstraint::AllowedBitmask(
+    const JsonConstraint::State& state) const {
+  return LookupOrBuild(state).bits;
 }
 }  // namespace gufo::sampling
