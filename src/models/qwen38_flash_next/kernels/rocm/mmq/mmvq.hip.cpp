@@ -692,6 +692,64 @@ int prepare_q8_decode() {
              : -2;
 }
 
+// Local experiment: a Q4_K dense projection. As in mul_mat_vec_q8, one wave
+// holds a weight row and every input, so the weights are read once per pass.
+template<int ncols_dst>
+__launch_bounds__(32, 1) static __global__
+    void mul_mat_vec_q4k_dense(const void* __restrict__ weights,
+                               const block_q8_1* __restrict__ input,
+                               float* __restrict__ output,
+                               const uint32_t ncols_x, const uint32_t nrows_x,
+                               const uint32_t stride_col_y) {
+  constexpr int qi = QI4_K;
+  constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  const int lane = threadIdx.x;
+  const int row = blockIdx.x;
+  const int blocks_per_row = ncols_x / QK_K;
+  const int row_offset = row * blocks_per_row;
+  const int kqs = vdr * (lane % (qi / vdr));
+  float sum[ncols_dst] = {};
+  for (int kbx = lane / (qi / vdr); kbx < blocks_per_row;
+       kbx += blocks_per_iter) {
+    const int kby = kbx * (QK_K / QK8_1);
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+      sum[j] += vec_dot_q4_K_q8_1(weights, input + j * stride_col_y + kby,
+                                  row_offset + kbx, kqs);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < ncols_dst; ++j) {
+    sum[j] = warp_reduce_sum<32>(sum[j]);
+    if (lane == 0)
+      output[j * nrows_x + row] = sum[j];
+  }
+}
+
+void mul_mat_vec_q4k_dense_dispatch(const void* weights,
+                                    const block_q8_1* input, float* output,
+                                    int k, int rows, int tokens,
+                                    int input_stride, hipStream_t stream) {
+  GGML_ASSERT(k % QK_K == 0 && rows > 0 && tokens >= 1 && tokens <= 8);
+#define QFN_Q4K_DENSE(n)                                                  \
+  case n:                                                                 \
+    mul_mat_vec_q4k_dense<n><<<rows, 32, 0, stream>>>(                    \
+        weights, input, output, k, rows, input_stride);                   \
+    break;
+  switch (tokens) {
+    QFN_Q4K_DENSE(1)
+    QFN_Q4K_DENSE(2)
+    QFN_Q4K_DENSE(3)
+    QFN_Q4K_DENSE(4)
+    QFN_Q4K_DENSE(5)
+    QFN_Q4K_DENSE(6)
+    QFN_Q4K_DENSE(7)
+    QFN_Q4K_DENSE(8)
+  }
+#undef QFN_Q4K_DENSE
+}
+
 void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
                              const block_q8_1* input, float* output, int k,
                              int rows, int tokens, int input_stride,

@@ -1589,11 +1589,23 @@ bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
     }
     if (w.q4k != nullptr && q.n <= kVecBatch) {
       // Local experiment: the Q4_K copy as one routed expert.
-      if (qfn_mmq_moe_vec_preq(static_cast<int>(GgmlType::kQ4_K), w.q4k,
-                               q.data, model_->q4k_ids(), out,
-                               static_cast<int>(w.rows),
-                               static_cast<int>(w.cols), static_cast<int>(q.n),
-                               1, 1, stream_) != 0) {
+      // GUFO_STRIX_Q4K_KERNEL=moe keeps the routed-expert kernel for A/B.
+      static const bool moe_kernel = [] {
+        const char* v = std::getenv("GUFO_STRIX_Q4K_KERNEL");
+        return v != nullptr && v[0] == 'm';
+      }();
+      const int rc =
+          moe_kernel
+              ? qfn_mmq_moe_vec_preq(static_cast<int>(GgmlType::kQ4_K), w.q4k,
+                                     q.data, model_->q4k_ids(), out,
+                                     static_cast<int>(w.rows),
+                                     static_cast<int>(w.cols),
+                                     static_cast<int>(q.n), 1, 1, stream_)
+              : qfn_mmq_q4_K_dense_vec_preq(w.q4k, q.data, out,
+                                            static_cast<int>(w.rows),
+                                            static_cast<int>(q.n),
+                                            static_cast<int>(w.cols), stream_);
+      if (rc != 0) {
         AssignError(error_msg, "Q4_K dense projection failed");
         return false;
       }
