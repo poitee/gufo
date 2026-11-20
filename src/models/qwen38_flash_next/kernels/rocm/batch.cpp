@@ -528,8 +528,6 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         auto& session = *items[i].session;
         if (!session.CheckCancellation(nullptr))
           continue;
-        ++session.mutation_epoch_;
-        session.mtp_.residual_valid = false;
         const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
         const auto capacity = session.index_capacity_;
         if (!PrepareAttention(
@@ -1266,7 +1264,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
 
   const auto& layers = model_->layers();
   bool can_graph = BatchGraphEnabled() && !prof.active && items.size() >= 2 &&
-                   rows > kDecodeRows && batch_gdn;
+                   batch_gdn;
   BatchGraphKey suffix_key{};
   suffix_key.kind = 2;
   suffix_key.count = static_cast<std::uint8_t>(items.size());

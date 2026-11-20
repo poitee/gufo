@@ -238,6 +238,8 @@ struct PrefillCheckpoint {
 /// Runs the trunk graph on the GPU for one session at a time. Buffers are
 /// sized once for `max_batch` tokens; longer prompts are fed in chunks.
 class Executor {
+  friend class Session;
+
 public:
   struct Options {
     std::uint32_t max_batch{1};

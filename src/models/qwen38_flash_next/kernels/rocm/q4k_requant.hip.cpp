@@ -236,9 +236,6 @@ __global__ void QuantizeQ8_0ToQ4KKernel(const Q8_0Block* __restrict__ q8,
   }
 }
 
-void QuantizeQ8_0ToQ4K(const void* q8, void* q4k, std::size_t rows,
-                       std::uint32_t cols, hipStream_t stream);
-
 __device__ __forceinline__ float E8m0ToFp32(std::uint8_t x) {
   const std::uint32_t bits =
       (x == 0) ? 0x00400000U : (static_cast<std::uint32_t>(x) << 23U);

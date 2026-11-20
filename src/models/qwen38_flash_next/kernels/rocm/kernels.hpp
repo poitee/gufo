@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
