@@ -496,6 +496,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       shadow(l.ssm_in, "ssm_in");
       shadow(l.ssm_out, "ssm_out");
       shadow(l.attn_qkv, "attn_qkv");
+      shadow(l.attn_out, "attn_out");
       shadow(l.shexp_up, "shexp");
       shadow(l.shexp_gate, "shexp");
       shadow(l.hc_attn.down, "hc_down");
@@ -514,6 +515,99 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     m->q4k_ids_ = static_cast<std::int32_t*>(ids);
     std::fprintf(stderr, "strix-q4k: %zu dense copies, %zu MiB (%s)\n", copies,
                  copy_bytes >> 20, list);
+  }
+  if (const char* q4k_mtp = std::getenv("GUFO_STRIX_Q4K_MTP");
+      m->has_mtp_ && q4k_mtp != nullptr && q4k_mtp[0] != '\0' &&
+      q4k_mtp[0] != '0') {
+    std::size_t dense_copies = 0;
+    std::size_t expert_tensors = 0;
+    std::size_t total_bytes = 0;
+    bool failed = false;
+    const auto shadow_mtp = [&](DeviceTensor& t) {
+      if (failed || t.empty() || t.type != core::GgmlType::kQ8_0 ||
+          t.cols % 256 != 0)
+        return;
+      const std::size_t size = std::size_t{t.rows} * (t.cols / 256) * 144;
+      void* q4k = nullptr;
+      if (hipMalloc(&q4k, size + kTailMargin) != hipSuccess) {
+        failed = true;
+        return;
+      }
+      m->allocations_.push_back(q4k);
+      m->bytes_ += size + kTailMargin;
+      QuantizeQ8_0ToQ4K(t.data, q4k, t.rows, t.cols, nullptr);
+      (void)hipMemsetAsync(static_cast<std::uint8_t*>(q4k) + size, 0,
+                           kTailMargin, nullptr);
+      t.q4k = q4k;
+      ++dense_copies;
+      total_bytes += size;
+    };
+    const auto convert_mtp_exps = [&](DeviceTensor& t) {
+      if (failed || t.empty() || t.type != core::GgmlType::kQ8_0 ||
+          t.cols % 256 != 0 || t.experts == 0)
+        return;
+      const std::size_t total_rows = std::size_t{t.experts} * t.rows;
+      const std::size_t size = total_rows * (t.cols / 256) * 144;
+      void* q4k = nullptr;
+      if (hipMalloc(&q4k, size + kTailMargin) != hipSuccess) {
+        failed = true;
+        return;
+      }
+      m->allocations_.push_back(q4k);
+      m->bytes_ += size + kTailMargin;
+      QuantizeQ8_0ToQ4K(t.data, q4k, total_rows, t.cols, nullptr);
+      (void)hipMemsetAsync(static_cast<std::uint8_t*>(q4k) + size, 0,
+                           kTailMargin, nullptr);
+      t.data = q4k;
+      t.type = core::GgmlType::kQ4_K;
+      ++expert_tensors;
+      total_bytes += size;
+    };
+    shadow_mtp(m->mtp_.attn_qkv);
+    shadow_mtp(m->mtp_.attn_out);
+    shadow_mtp(m->mtp_.nextn_fc_embedding);
+    shadow_mtp(m->mtp_.nextn_fc_hidden);
+    shadow_mtp(m->mtp_.hc_attn.down);
+    shadow_mtp(m->mtp_.hc_ffn.down);
+    shadow_mtp(m->mtp_.nextn_head.down);
+    shadow_mtp(m->mtp_.shexp_up);
+    shadow_mtp(m->mtp_.shexp_gate);
+    convert_mtp_exps(m->mtp_.ffn_gate_exps);
+    convert_mtp_exps(m->mtp_.ffn_up_exps);
+    if (failed || hipDeviceSynchronize() != hipSuccess) {
+      if (error_msg != nullptr)
+        *error_msg = "Q4_K MTP conversion failed";
+      return nullptr;
+    }
+    std::fprintf(stderr,
+                 "strix-q4k-mtp: %zu dense copies, %zu expert tensors, %zu MiB\n",
+                 dense_copies, expert_tensors, total_bytes >> 20);
+  }
+  if (const char* selftest = std::getenv("GUFO_STRIX_Q4K_SELFTEST");
+      selftest != nullptr && selftest[0] != '\0' && selftest[0] != '0') {
+    const DeviceTensor* probe = nullptr;
+    const auto check_probe = [&](const DeviceTensor& t) {
+      if (probe == nullptr && t.q4k != nullptr && t.cols % 256 == 0)
+        probe = &t;
+    };
+    if (m->has_mtp_) {
+      check_probe(m->mtp_.attn_qkv);
+      check_probe(m->mtp_.attn_out);
+      check_probe(m->mtp_.nextn_fc_embedding);
+    }
+    if (!m->layers_.empty()) {
+      check_probe(m->layers_[0].ssm_in);
+      check_probe(m->layers_[0].ssm_out);
+      check_probe(m->layers_[0].attn_qkv);
+    }
+    if (probe != nullptr &&
+        qfn_mmq_q4_K_wmma_selftest(probe->q4k, static_cast<int>(probe->rows),
+                                   static_cast<int>(probe->cols),
+                                   nullptr) != 0) {
+      if (error_msg != nullptr)
+        *error_msg = "Q4_K WMMA selftest failed";
+      return nullptr;
+    }
   }
   return m;
 }

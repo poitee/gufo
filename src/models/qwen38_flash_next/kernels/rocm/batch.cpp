@@ -1,9 +1,12 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
+#include <vector>
 
 #include "qfn_mmq.h"
 #include "src/core/hip/managed_alloc.hpp"
@@ -25,6 +28,64 @@ bool WideBatchEnabled() noexcept {
   }();
   return enabled;
 }
+
+bool ProfileEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_PROFILE");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
+constexpr int kProfLimit = 25;
+
+struct FwdProfState {
+  std::mutex mu;
+  std::vector<hipEvent_t> events;
+  int rounds{0};
+  double total_rows{0};
+  double hc{0}, qkv{0}, gdn{0}, attn{0}, out_proj{0}, router{0}, shexp{0},
+      moe_gu{0}, moe_dn{0}, comb{0}, lm{0}, other{0}, total{0};
+};
+
+FwdProfState& GetFwdProf() {
+  static FwdProfState s;
+  return s;
+}
+
+struct FwdPassEvents {
+  bool active{false};
+  std::vector<hipEvent_t>* ev{nullptr};
+  int count{0};
+  hipStream_t stream{nullptr};
+  struct LayerMarks {
+    bool linear{false};
+    bool reuse_q8{false};
+    bool routed_q4k{false};
+    int base{0};
+  };
+  std::array<LayerMarks, 64> layers{};
+  int num_layers{0};
+  int head_base{0};
+
+  int Mark() {
+    if (!active)
+      return -1;
+    if (count >= static_cast<int>(ev->size())) {
+      hipEvent_t e = nullptr;
+      if (hipEventCreate(&e) != hipSuccess) {
+        active = false;
+        return -1;
+      }
+      ev->push_back(e);
+    }
+    if (hipEventRecord((*ev)[count], stream) != hipSuccess) {
+      active = false;
+      return -1;
+    }
+    return count++;
+  }
+};
 
 bool Fail(std::string* error, const std::string& message) {
   if (error != nullptr) {
@@ -62,6 +123,16 @@ WeightType EmbeddingType(core::GgmlType type) {
       throw std::logic_error("unsupported Flash-Next embedding format");
   }
 }
+
+thread_local FwdPassEvents* g_fwd_prof = nullptr;
+
+struct ScopedFwdProf {
+  FwdPassEvents* prev;
+  explicit ScopedFwdProf(FwdPassEvents* p) noexcept : prev(g_fwd_prof) {
+    g_fwd_prof = p;
+  }
+  ~ScopedFwdProf() { g_fwd_prof = prev; }
+};
 
 }  // namespace
 
@@ -184,8 +255,12 @@ void Executor::CombineBatch(float* res, const float* gamma,
             c.hidden_size, c.hc_count, c.rms_eps, stream_, true);
 }
 
+bool Executor::SyncStream(std::string* error) const {
+  return Check(hipStreamSynchronize(stream_), error);
+}
+
 bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
-                               std::string* error) const {
+                               std::string* error, bool sync) const {
   const Config& c = config();
   DropReadyQ8();
   if (!has_mtp() || items.empty() || items.size() > kBatchSessions) {
@@ -447,7 +522,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     UseScratch(base);
     throw;
   }
-  const auto status = hipStreamSynchronize(stream_);
+  const auto status =
+      (sync || !ok) ? hipStreamSynchronize(stream_) : hipSuccess;
   UseScratch(base);
   if (!ok || !Check(status, error))
     return false;
@@ -487,11 +563,14 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   }
   const auto& head = model_->mtp().nextn_head;
   if (!AnyActive(items))
-    return true;
+    return Check(hipStreamSynchronize(stream_), error);
   if (items.size() == 1) {
     for (const auto& item : items) {
-      if (!item.session->CheckCancellation(nullptr))
+      if (!item.session->CheckCancellation(nullptr)) {
+        if (!Check(hipStreamSynchronize(stream_), error))
+          return false;
         continue;
+      }
       if (!MtpHead(head, item.session->mtp_.h, item.output.token != nullptr,
                    item.output.candidates != nullptr,
                    UseDraftSubset(*item.session, item.output.draft_subset)
@@ -656,7 +735,8 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
     UseScratch(base);
     throw;
   }
-  const auto status = hipStreamSynchronize(stream_);
+  const auto status =
+      (sync || !ok) ? hipStreamSynchronize(stream_) : hipSuccess;
   UseScratch(base);
   if (!ok || !Check(status, error))
     return false;
@@ -708,13 +788,14 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   if (!QuantizeBatch(x, rows, w.cols, error))
     return false;
   if (w.q4k != nullptr && rows <= 64) {
-    for (std::uint32_t r = 0; r < rows; r += 32) {
+    const std::uint32_t step = (rows > 32 && rows <= 48) ? 48U : 32U;
+    for (std::uint32_t r = 0; r < rows; r += step) {
       const auto* input = static_cast<const std::uint8_t*>(s_.x_q8t) +
                           qfn_mmq_q8_1_bytes(r, w.cols);
       if (qfn_mmq_q4_K_dense_vec_preq(
               w.q4k, nullptr, input,
               out + static_cast<std::size_t>(r) * w.rows, w.rows,
-              std::min(32U, rows - r), w.cols, stream_) != 0)
+              std::min(step, rows - r), w.cols, stream_) != 0)
         return Fail(error, "batched Q4_K projection failed");
     }
     return true;
@@ -730,7 +811,7 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   };
   const bool wide = WideBatchEnabled();
   if (w.rows == 320 && w.cols == 10240) {
-    if (wide && rows <= 32)
+    if (wide && rows <= 48)
       return project(0, rows);
     const auto full = rows / kDecodeRows * kDecodeRows;
     return project(0, full) && (full == rows || project(full, rows - full));
@@ -740,12 +821,15 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   // wide batching is enabled.
   const bool matrix_shape =
       (w.cols == 2560 && w.rows >= 1024) || (w.cols == 320 && w.rows == 10240);
+  const bool wide_wmma = wide && w.rows >= 256;
   const auto chunk =
       (wide || matrix_shape)
-          ? (w.cols == 2560 && w.rows >= 8192 && rows > 32 && rows <= 48 ? 48U
-                                                                         : 32U)
+          ? (((wide_wmma || (w.cols == 2560 && w.rows >= 8192)) &&
+              rows > 32 && rows <= 48)
+                 ? 48U
+                 : 32U)
           : kDecodeRows;
-  if (chunk == 32 && matrix_shape && rows >= 64) {
+  if (chunk == 32 && (matrix_shape || wide_wmma) && rows >= 64) {
     const auto full = rows / 32 * 32;
     return project(0, full) && (full == rows || project(full, rows - full));
   }
@@ -766,8 +850,9 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
   const bool q4k = q8 && up.q4k != nullptr && gate.q4k != nullptr;
   if ((q4k || q8) && !QuantizeBatch(x, rows, up.cols, error))
     return false;
-  const std::uint32_t step =
-      (q4k || (WideBatchEnabled() && q8)) ? 32U : kDecodeRows;
+  const std::uint32_t step = q4k
+                                 ? (rows > 32 && rows <= 48 ? 48U : 32U)
+                                 : (WideBatchEnabled() && q8 ? 32U : kDecodeRows);
   for (std::uint32_t r = 0; r < rows; r += step) {
     const auto n = std::min(step, rows - r);
     if (q4k) {
@@ -803,13 +888,19 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     return Moe(l, x, out, rows, error);
   const auto& c = config();
   const Scratch base = s_;
+  auto* const prof = g_fwd_prof;
+  const int li = prof ? prof->num_layers : 0;
   if (!DenseBatch(l.router, x, base.router, rows, error))
     return false;
   RouterTopK(base.router, c.num_experts + 1, base.ids, base.weights, rows,
              c.num_experts, c.num_experts_used, stream_);
+  if (prof && prof->active)
+    prof->layers[li].base = prof->layers[li].base;  // marks updated below
+  int e_rtr = prof ? prof->Mark() : -1;
   if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
                        error))
     return false;
+  int e_sh1 = prof ? prof->Mark() : -1;
   const bool routed_q4k = l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
                           l.ffn_up_exps.type == core::GgmlType::kQ4_K;
   const bool reuse_q8 =
@@ -819,6 +910,12 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
       l.shexp_up.rows == l.shexp_gate.rows &&
       l.shexp_up.cols == l.shexp_gate.cols &&
       l.shexp_up.cols == c.hidden_size;
+  if (prof && prof->active) {
+    prof->layers[li].reuse_q8 = reuse_q8;
+    prof->layers[li].routed_q4k = routed_q4k;
+    (void)e_rtr;
+    (void)e_sh1;
+  }
   if (reuse_q8) {
     // base.x_q8t holds quantized x from GatedDenseBatch until shexp_down
     // overwrites it.
@@ -829,19 +926,26 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                                    c.num_experts, c.num_experts_used,
                                    stream_) != 0)
       return Fail(error, "batched routed vector projection failed");
+    if (prof)
+      (void)prof->Mark();
   }
   if (!DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
     return false;
+  if (prof)
+    (void)prof->Mark();
   if (routed_q4k) {
     // Share expert weights across request boundaries while retaining the
     // scalar Q8 activation quantization and dot-product reduction.
-    if ((!reuse_q8 &&
-         qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),
-                               l.ffn_gate_exps.data, l.ffn_up_exps.data, x,
-                               base.ids, base.gate_e, c.expert_ff,
-                               c.hidden_size, rows, c.num_experts,
-                               c.num_experts_used, stream_) != 0) ||
-        qfn_mmq_moe_vec(
+    if (!reuse_q8 &&
+        qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),
+                              l.ffn_gate_exps.data, l.ffn_up_exps.data, x,
+                              base.ids, base.gate_e, c.expert_ff,
+                              c.hidden_size, rows, c.num_experts,
+                              c.num_experts_used, stream_) != 0)
+      return Fail(error, "batched routed vector projection failed");
+    if (!reuse_q8 && prof)
+      (void)prof->Mark();
+    if (qfn_mmq_moe_vec(
             static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
             base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,
             rows * c.num_experts_used, c.num_experts, 1, stream_) != 0)
@@ -849,6 +953,8 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     MoeEpilogue(base.down_e, base.weights, base.shexp_out,
                 base.router + c.num_experts, c.num_experts + 1, out, rows,
                 c.num_experts_used, c.hidden_size, stream_);
+    if (prof)
+      (void)prof->Mark();
     return true;
   }
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
@@ -860,6 +966,8 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
     if (!ok)
       return false;
   }
+  if (prof)
+    (void)prof->Mark();
   return true;
 }
 
@@ -993,11 +1101,33 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   }
 
   const Scratch base = s_;
+  FwdPassEvents prof;
+  auto& prof_state = GetFwdProf();
+  std::unique_lock<std::mutex> prof_lock(prof_state.mu, std::defer_lock);
+  if (ProfileEnabled() && rows > kDecodeRows && c.num_layers <= prof.layers.size()) {
+    std::uint32_t max_pos = 0;
+    for (const auto& item : items)
+      max_pos = std::max(max_pos, item.session->position_);
+    if (max_pos >= 4096) {
+      prof_lock.lock();
+      if (prof_state.rounds < kProfLimit) {
+        prof.active = true;
+        prof.ev = &prof_state.events;
+        prof.stream = stream_;
+      } else {
+        prof_lock.unlock();
+      }
+    }
+  }
+  ScopedFwdProf prof_scope(prof.active ? &prof : nullptr);
   // Every exit restores the ordinary single-session scratch view. Enqueued
   // work is drained before a caller can reuse its pinned staging buffers.
   const auto body = [&]() -> bool {
-    if (!AnyActive(items))
+    if (!AnyActive(items)) {
+      prof.active = false;
       return true;
+    }
+    (void)prof.Mark();  // event 0: pass start
     for (std::size_t i = 0; i < items.size(); ++i) {
       if (!Check(hipMemcpyAsync(items[i].session->control_, batch_controls_ + i,
                                 sizeof(Session::Control), hipMemcpyHostToDevice,
@@ -1024,9 +1154,16 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     const auto& layers = model_->layers();
     bool normed = false;
     for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-      if (!AnyActive(items))
+      if (!AnyActive(items)) {
+        prof.active = false;
         return true;
+      }
       const auto& l = layers[il];
+      if (prof.active) {
+        prof.num_layers = static_cast<int>(il);
+        prof.layers[il].linear = l.linear;
+        prof.layers[il].base = prof.Mark();  // layer start (before PLE)
+      }
       if (c.IsPleLayer(il) && !WaitPle(error))
         return false;
       for (std::size_t i = 0; i < items.size(); ++i) {
@@ -1039,9 +1176,11 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         }
       }
       UseScratch(base);
+      (void)prof.Mark();  // +1: before hc_attn
       if (!HcMixBatch(l.hc_attn, base.res, normed, base.mixed, base.inject,
                       rows, error))
         return false;
+      (void)prof.Mark();  // +2: before qkv/ssm_in
       if (l.linear) {
         if ((!l.ssm_in.empty()
                  ? !DenseBatch(l.ssm_in, base.mixed, base.qkvz, rows, error)
@@ -1065,6 +1204,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
           return false;
         }
       }
+      (void)prof.Mark();  // +3: before gdn/attn
       std::uint32_t gdn_active = 0;
       for (std::size_t i = 0; i < items.size(); ++i) {
         const auto& item = items[i];
@@ -1130,15 +1270,19 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
           return Fail(error, "batched GatedDeltaNet launch failed");
       }
       UseScratch(base);
+      (void)prof.Mark();  // +4: before ssm_out/attn_out
       if (!DenseBatch(l.linear ? l.ssm_out : l.attn_out,
                       l.linear ? base.gdn_out : base.ctx, base.block_out, rows,
                       error)) {
         return false;
       }
+      (void)prof.Mark();  // +5: before CombineBatch(attn)
       CombineBatch(base.res, l.hc_ffn.norm.f32(), rows);
+      (void)prof.Mark();  // +6: before HcMixBatch(ffn)
       if (!HcMixBatch(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
                       error))
         return false;
+      (void)prof.Mark();  // +7: before MoeBatch
       if (!MoeBatch(l, base.mixed, base.block_out, rows, error))
         return false;
       const float* next_norm =
@@ -1148,8 +1292,11 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
               : model_->hc_head().norm.f32();
       UseScratch(base);
       CombineBatch(base.res, next_norm, rows);
+      (void)prof.Mark();  // last layer mark: after CombineBatch(ffn)
       normed = next_norm != nullptr;
     }
+    if (prof.active)
+      prof.num_layers = static_cast<int>(c.num_layers);
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
       UseScratch(RowScratch(base, offsets[i]));
@@ -1163,9 +1310,15 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       }
     }
     UseScratch(base);
-    return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
-                      rows, error) &&
-           DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
+    prof.head_base = prof.Mark();  // before hc_head
+    if (!HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
+                    rows, error))
+      return false;
+    (void)prof.Mark();  // before output_
+    if (!DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error))
+      return false;
+    (void)prof.Mark();  // end of pass
+    return true;
   };
   bool ok = false;
   try {
@@ -1179,6 +1332,74 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   UseScratch(base);
   if (!ok || !Check(status, error)) {
     return false;
+  }
+  if (prof.active && prof.count >= 4) {
+    const auto span_ms = [&](int a, int b) -> double {
+      float ms = 0.0f;
+      if (a >= 0 && b > a && b < prof.count)
+        (void)hipEventElapsedTime(&ms, (*prof.ev)[a], (*prof.ev)[b]);
+      return static_cast<double>(ms);
+    };
+    const int n_layers = prof.num_layers;
+    if (n_layers > 0 && prof.head_base >= 0) {
+      prof_state.other += span_ms(0, prof.layers[0].base);
+      for (int il = 0; il < n_layers; ++il) {
+        const auto& L = prof.layers[il];
+        const int b = L.base;
+        const int next_start =
+            il + 1 < n_layers ? prof.layers[il + 1].base : prof.head_base;
+        prof_state.other += span_ms(b, b + 1);
+        prof_state.hc += span_ms(b + 1, b + 2);
+        prof_state.qkv += span_ms(b + 2, b + 3);
+        if (L.linear)
+          prof_state.gdn += span_ms(b + 3, b + 4);
+        else
+          prof_state.attn += span_ms(b + 3, b + 4);
+        prof_state.out_proj += span_ms(b + 4, b + 5);
+        prof_state.comb += span_ms(b + 5, b + 6);
+        prof_state.hc += span_ms(b + 6, b + 7);
+        prof_state.router += span_ms(b + 7, b + 8);
+        prof_state.shexp += span_ms(b + 8, b + 9);
+        int after_moe = b + 11;
+        if (L.reuse_q8) {
+          prof_state.moe_gu += span_ms(b + 9, b + 10);
+          prof_state.shexp += span_ms(b + 10, b + 11);
+          prof_state.moe_dn += span_ms(b + 11, b + 12);
+          after_moe = b + 12;
+        } else if (L.routed_q4k) {
+          prof_state.shexp += span_ms(b + 9, b + 10);
+          prof_state.moe_gu += span_ms(b + 10, b + 11);
+          prof_state.moe_dn += span_ms(b + 11, b + 12);
+          after_moe = b + 12;
+        } else {
+          prof_state.shexp += span_ms(b + 9, b + 10);
+          prof_state.moe_dn += span_ms(b + 10, b + 11);
+          after_moe = b + 11;
+        }
+        prof_state.comb += span_ms(after_moe, after_moe + 1);
+        prof_state.other += span_ms(after_moe + 1, next_start);
+      }
+      prof_state.hc += span_ms(prof.head_base, prof.head_base + 1);
+      prof_state.lm += span_ms(prof.head_base + 1, prof.head_base + 2);
+      prof_state.total += span_ms(0, prof.head_base + 2);
+      prof_state.total_rows += rows;
+      ++prof_state.rounds;
+      if (prof_state.rounds == kProfLimit) {
+        const double inv = 1.0 / kProfLimit;
+        std::fprintf(
+            stderr,
+            "strix-prof-fwd (n=%d avg_rows=%.1f): total=%.1fms | hc=%.1f "
+            "qkv=%.1f gdn=%.1f attn=%.1f out=%.1f router=%.1f shexp=%.1f "
+            "moe_gu=%.1f moe_dn=%.1f comb=%.1f lm=%.1f other=%.1f\n",
+            kProfLimit, prof_state.total_rows * inv, prof_state.total * inv,
+            prof_state.hc * inv, prof_state.qkv * inv, prof_state.gdn * inv,
+            prof_state.attn * inv, prof_state.out_proj * inv,
+            prof_state.router * inv, prof_state.shexp * inv,
+            prof_state.moe_gu * inv, prof_state.moe_dn * inv,
+            prof_state.comb * inv, prof_state.lm * inv,
+            prof_state.other * inv);
+      }
+    }
   }
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (items[i].session->Cancelled())

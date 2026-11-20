@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <type_traits>
 
@@ -77,6 +78,34 @@ struct StrixMtpGateConfig {
   std::uint32_t max_c2{0};
   std::uint32_t max_c3{0};
 };
+
+bool WideBatchEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_WIDE_BATCH");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
+bool ProfileEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_PROFILE");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
+struct RoundProfState {
+  std::mutex mu;
+  int rounds{0};
+  double total{0}, catchup{0}, heads{0}, bodies{0}, fwd{0}, finish{0};
+  double reqs{0}, rows{0}, steps{0};
+};
+
+RoundProfState& GetRoundProf() {
+  static RoundProfState s;
+  return s;
+}
 
 const StrixMtpGateConfig& StrixMtpGateConfigValues() {
   static const StrixMtpGateConfig cfg = [] {
@@ -723,7 +752,8 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
 
 bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg,
-                                std::span<const std::uint8_t> propose) {
+                                std::span<const std::uint8_t> propose,
+                                bool sync) {
   if (requests.empty())
     return true;
   if (!propose.empty() && propose.size() != requests.size()) {
@@ -746,7 +776,7 @@ bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
     items.push_back({session.session_.get(), replays[i], hidden_row,
                      propose.empty() || !propose[i]});
   }
-  return items.empty() || exec.MtpForwardBatch(items, error_msg);
+  return items.empty() || exec.MtpForwardBatch(items, error_msg, sync);
 }
 
 bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
@@ -1563,6 +1593,17 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
         policy.Choose(std::span(rows).first(requests.size()), batch_context);
   }
   const auto cycle_start = std::chrono::steady_clock::now();
+  bool prof_round = false;
+  auto& rprof = GetRoundProf();
+  if (ProfileEnabled() && batch_context >= 4096) {
+    std::lock_guard lock(rprof.mu);
+    prof_round = rprof.rounds < 25;
+  }
+  const auto now_ms = [](auto a, auto b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  double p_catchup = 0, p_heads = 0, p_bodies = 0, p_fwd = 0, p_finish = 0;
+  int p_steps = 0;
   std::vector<PendingDecode> pending(requests.size());
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& r = requests[i];
@@ -1585,8 +1626,15 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
                         pending[i].chain.size() < pending[i].width);
     }
   }
-  if (!DraftCatchUpBatch(catchup, error_msg, propose))
+  const bool any_propose =
+      std::ranges::any_of(propose, [](std::uint8_t p) { return p != 0; });
+  const bool async_mtp = WideBatchEnabled() && any_propose;
+  const auto t_c0 = std::chrono::steady_clock::now();
+  if (!DraftCatchUpBatch(catchup, error_msg, propose, !async_mtp))
     return false;
+  if (prof_round)
+    p_catchup = now_ms(t_c0, std::chrono::steady_clock::now());
+  bool mtp_deferred_sync = async_mtp && !catchup.empty();
   // Each round shares predictor projections across ready sessions.
   // Attention state, proposal distributions and RNG streams stay private.
   for (;;) {
@@ -1604,10 +1652,22 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
               .draft_subset = p.draft_subset}});
       }
     }
-    if (heads.empty())
+    if (heads.empty()) {
+      if (mtp_deferred_sync) {
+        if (!exec.SyncStream(error_msg))
+          return false;
+        mtp_deferred_sync = false;
+      }
       break;
+    }
+    const auto t_h0 = std::chrono::steady_clock::now();
     if (!exec.MtpHeads(heads, error_msg))
       return false;
+    mtp_deferred_sync = false;
+    if (prof_round) {
+      p_heads += now_ms(t_h0, std::chrono::steady_clock::now());
+      ++p_steps;
+    }
     for (std::size_t i = 0; i < requests.size(); ++i) {
       auto& p = pending[i];
       if (requests[i].session->session_->Cancelled() || !p.speculative ||
@@ -1643,8 +1703,14 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
         bodies.push_back({requests[i].session->session_.get(),
                           std::span<const std::int32_t>(&p.draft, 1), -1});
     }
-    if (!bodies.empty() && !exec.MtpForwardBatch(bodies, error_msg))
-      return false;
+    if (!bodies.empty()) {
+      const auto t_b0 = std::chrono::steady_clock::now();
+      if (!exec.MtpForwardBatch(bodies, error_msg, !WideBatchEnabled()))
+        return false;
+      mtp_deferred_sync = WideBatchEnabled();
+      if (prof_round)
+        p_bodies += now_ms(t_b0, std::chrono::steady_clock::now());
+    }
   }
   // In an all-greedy cohort, full copies can widen verification far beyond
   // the neural planner's chosen shape and delay peers producing new text.
@@ -1676,8 +1742,12 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
                        pending[i].speculative});
     }
   }
+  const auto t_f0 = std::chrono::steady_clock::now();
   if (!items.empty() && !exec.ForwardBatch(items, error_msg))
     return false;
+  const auto t_f1 = std::chrono::steady_clock::now();
+  if (prof_round)
+    p_fwd = now_ms(t_f0, t_f1);
   std::uint32_t offset = 0;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& p = pending[i];
@@ -1710,6 +1780,35 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
           session.FinishDecode(r, p, &r.outcome->error);
     } catch (const std::exception& exception) {
       r.outcome->error = exception.what();
+    }
+  }
+  if (prof_round) {
+    const auto t_end = std::chrono::steady_clock::now();
+    p_finish = now_ms(t_f1, t_end);
+    const double p_total = now_ms(cycle_start, t_end);
+    std::lock_guard lock(rprof.mu);
+    if (rprof.rounds < 25) {
+      rprof.total += p_total;
+      rprof.catchup += p_catchup;
+      rprof.heads += p_heads;
+      rprof.bodies += p_bodies;
+      rprof.fwd += p_fwd;
+      rprof.finish += p_finish;
+      rprof.reqs += static_cast<double>(requests.size());
+      rprof.rows += static_cast<double>(offset);
+      rprof.steps += static_cast<double>(p_steps);
+      ++rprof.rounds;
+      if (rprof.rounds == 25) {
+        const double inv = 1.0 / 25.0;
+        std::fprintf(
+            stderr,
+            "strix-prof-round (n=25 avg_reqs=%.1f avg_rows=%.1f "
+            "avg_steps=%.1f): total=%.1fms | catchup=%.1f mtp_heads=%.1f "
+            "mtp_bodies=%.1f fwd=%.1f finish=%.1f\n",
+            rprof.reqs * inv, rprof.rows * inv, rprof.steps * inv,
+            rprof.total * inv, rprof.catchup * inv, rprof.heads * inv,
+            rprof.bodies * inv, rprof.fwd * inv, rprof.finish * inv);
+      }
     }
   }
   const bool used_lookup =

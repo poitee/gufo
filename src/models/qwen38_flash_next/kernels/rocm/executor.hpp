@@ -355,7 +355,9 @@ public:
   /// Runs independent short predictor chains with shared projections and
   /// private attention caches, positions and carried hidden states.
   [[nodiscard]] bool MtpForwardBatch(std::span<const MtpBatchItem> items,
-                                     std::string* error_msg) const;
+                                     std::string* error_msg,
+                                     bool sync = true) const;
+  [[nodiscard]] bool SyncStream(std::string* error_msg = nullptr) const;
   /// Projects each session's carried draft hidden state with shared weights.
   [[nodiscard]] bool MtpHeads(std::span<const MtpHeadItem> items,
                               std::string* error_msg) const;

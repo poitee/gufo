@@ -16,6 +16,7 @@
 #include <cfloat>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>

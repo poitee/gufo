@@ -39,10 +39,13 @@ int qfn_mmq_moe_vec(int weight_type, const void* W, const float* X_f32,
                     int n_experts, int n_expert_used, hipStream_t stream,
                     const void* W_b = nullptr, float* out_b = nullptr);
 
-// Q4_K dense projection of 1-32 caller-quantized rows (local experiment).
+// Q4_K dense projection of 1-48 caller-quantized rows (local experiment).
 int qfn_mmq_q4_K_dense_vec_preq(const void* W, const void* W_gate,
                                 const void* X_q8, float* out, int M, int N,
                                 int K, hipStream_t stream);
+
+int qfn_mmq_q4_K_wmma_selftest(const void* W_q4k, int M, int K,
+                               hipStream_t stream);
 
 // qfn_mmq_moe_vec over a caller-quantized Q8_1 input (local experiment).
 int qfn_mmq_moe_vec_preq(int weight_type, const void* W, const void* X_q8,

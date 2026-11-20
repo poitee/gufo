@@ -10,6 +10,13 @@ namespace qfn_mmq {
 #include "mmid.hpp"
 static int g_routed_max_expert_rows = 0;
 static int g_routed_tile_cols = 0;
+static bool WideBatchWmma() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_WIDE_BATCH");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
 static int prepare_decode_kernels();
 extern "C" int qfn_mmq_init(int device) {
     if (device < 0) {
@@ -512,7 +519,7 @@ extern "C" int qfn_mmq_q4_K_dense_vec_preq(const void* W, const void* W_gate,
                                            const void* X_q8, float* out_f32,
                                            int M, int N, int K,
                                            hipStream_t stream) {
-  if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || N > 32 || K <= 0 ||
+  if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || N > 48 || K <= 0 ||
       K % 256 != 0) {
     fprintf(stderr, "qfn_mmq_q4_K_dense_vec_preq: bad arguments M=%d N=%d K=%d\n",
             M, N, K);
@@ -523,6 +530,100 @@ extern "C" int qfn_mmq_q4_K_dense_vec_preq(const void* W, const void* W_gate,
                                  static_cast<const block_q8_1*>(X_q8), out_f32,
                                  K, M, N, input_stride, stream);
   return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+extern "C" int qfn_mmq_q4_K_wmma_selftest(const void* W_q4k, int M, int K,
+                                          hipStream_t stream) {
+  if (!W_q4k || M <= 0 || K <= 0 || K % 256 != 0)
+    return -1;
+  constexpr int kMaxTokens = 20;
+  const int test_m = M >= 37 ? 37 : M;
+  std::vector<float> h_x(static_cast<size_t>(kMaxTokens) * K);
+  for (int r = 0; r < kMaxTokens; ++r) {
+    for (int i = 0; i < K; ++i) {
+      const int v = ((i * 37 + r * 19 + 11) % 63) - 31;
+      h_x[static_cast<size_t>(r) * K + i] = static_cast<float>(v) * 0.015625f;
+    }
+  }
+  float* d_x = nullptr;
+  void* d_q8 = nullptr;
+  float* d_ref = nullptr;
+  float* d_out = nullptr;
+  const size_t x_bytes = h_x.size() * sizeof(float);
+  const size_t q8_bytes = qfn_mmq_q8_1_bytes(kMaxTokens, K);
+  const size_t out_bytes = static_cast<size_t>(kMaxTokens) * test_m * sizeof(float);
+  if (hipMalloc(&d_x, x_bytes) != hipSuccess ||
+      hipMalloc(&d_q8, q8_bytes) != hipSuccess ||
+      hipMalloc(&d_ref, out_bytes) != hipSuccess ||
+      hipMalloc(&d_out, out_bytes) != hipSuccess) {
+    if (d_x) (void)hipFree(d_x);
+    if (d_q8) (void)hipFree(d_q8);
+    if (d_ref) (void)hipFree(d_ref);
+    if (d_out) (void)hipFree(d_out);
+    return -1;
+  }
+  bool ok =
+      hipMemcpyAsync(d_x, h_x.data(), x_bytes, hipMemcpyHostToDevice, stream) ==
+          hipSuccess &&
+      hipMemsetAsync(d_ref, 0, out_bytes, stream) == hipSuccess &&
+      hipMemsetAsync(d_out, 0, out_bytes, stream) == hipSuccess &&
+      qfn_mmq_quantize_q8_1(d_x, d_q8, kMaxTokens, K, stream) == 0;
+  std::vector<float> h_ref(static_cast<size_t>(kMaxTokens) * test_m);
+  std::vector<float> h_got(static_cast<size_t>(kMaxTokens) * test_m);
+  float ungated_err = 0.0f;
+  float gated_err = 0.0f;
+  bool all_finite = true;
+  const int counts[] = {12, 16, 20};
+  for (int g = 0; g < 2 && ok; ++g) {
+    const void* W_gate = g ? W_q4k : nullptr;
+    for (int r = 0; r < kMaxTokens && ok; ++r) {
+      const void* x_r = static_cast<const uint8_t*>(d_q8) +
+                        qfn_mmq_q8_1_bytes(r, K);
+      ok = qfn_mmq_q4_K_dense_vec_preq(W_q4k, W_gate, x_r,
+                                       d_ref + static_cast<size_t>(r) * test_m,
+                                       test_m, 1, K, stream) == 0;
+    }
+    ok = ok && hipStreamSynchronize(stream) == hipSuccess &&
+         hipMemcpyAsync(h_ref.data(), d_ref, out_bytes, hipMemcpyDeviceToHost,
+                        stream) == hipSuccess &&
+         hipStreamSynchronize(stream) == hipSuccess;
+    for (int ci = 0; ci < 3 && ok; ++ci) {
+      const int n = counts[ci];
+      const size_t n_bytes = static_cast<size_t>(n) * test_m * sizeof(float);
+      ok = hipMemsetAsync(d_out, 0, out_bytes, stream) == hipSuccess &&
+           qfn_mmq_q4_K_dense_vec_preq(W_q4k, W_gate, d_q8, d_out, test_m, n, K,
+                                       stream) == 0 &&
+           hipStreamSynchronize(stream) == hipSuccess &&
+           hipMemcpyAsync(h_got.data(), d_out, n_bytes, hipMemcpyDeviceToHost,
+                          stream) == hipSuccess &&
+           hipStreamSynchronize(stream) == hipSuccess;
+      if (!ok)
+        break;
+      for (size_t idx = 0; idx < static_cast<size_t>(n) * test_m; ++idx) {
+        const float rv = h_ref[idx];
+        const float gv = h_got[idx];
+        if (!std::isfinite(rv) || !std::isfinite(gv)) {
+          all_finite = false;
+          continue;
+        }
+        const float d = rv > gv ? rv - gv : gv - rv;
+        if (g == 0)
+          ungated_err = d > ungated_err ? d : ungated_err;
+        else
+          gated_err = d > gated_err ? d : gated_err;
+      }
+    }
+  }
+  (void)hipFree(d_x);
+  (void)hipFree(d_q8);
+  (void)hipFree(d_ref);
+  (void)hipFree(d_out);
+  std::fprintf(stderr,
+               "strix-q4k-selftest: M=%d K=%d ungated_err=%.3e gated_err=%.3e\n",
+               test_m, K, ungated_err, gated_err);
+  if (!ok || !all_finite || ungated_err >= 1e-2f || gated_err >= 1e-2f)
+    return -1;
+  return 0;
 }
 
 extern "C" int qfn_mmq_moe_vec_preq(int weight_type, const void* W,
@@ -721,10 +822,15 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
                                            const void* X_q8, float* out_f32,
                                            int M, int N, int K,
                                            hipStream_t stream) {
-  const bool wide_matrix = K == 2560 && M >= 8192 && N <= 48;
+  const bool wide_wmma = WideBatchWmma();
+  const bool wide_matrix =
+      ((K == 2560 && M >= 8192) ||
+       (wide_wmma && !W_gate && M >= 256 && K % 32 == 0)) &&
+      N <= 48;
   const bool grouped_matrix =
       N > 48 && N % 32 == 0 &&
-      ((K == 2560 && M >= 1024) || (K == 320 && M == 10240));
+      ((K == 2560 && M >= 1024) || (K == 320 && M == 10240) ||
+       (wide_wmma && !W_gate && M >= 256 && K % 32 == 0));
   if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || K <= 0 || K % 32 != 0 ||
       (N > 32 && !wide_matrix && !grouped_matrix &&
        (M != 320 || K != 10240 || N % 8 != 0)) ||
@@ -738,7 +844,8 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
     launch_q8_hc_down(W, X_q8, out_f32, N, stream);
     return hipGetLastError() == hipSuccess ? 0 : -3;
   }
-  if (N > MMVQ_MAX_BATCH_SIZE && N % 8 == 0 && M == 320 && K == 10240) {
+  if (N > MMVQ_MAX_BATCH_SIZE && N % 8 == 0 && M == 320 && K == 10240 &&
+      !(wide_wmma && N <= 48)) {
     qfn_q8_hc_down_kernel<8, true><<<dim3(320, N / 8), 32, 0, stream>>>(
         static_cast<const block_q8_0*>(W),
         static_cast<const block_q8_1*>(X_q8), out_f32);

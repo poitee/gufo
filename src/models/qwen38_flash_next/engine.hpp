@@ -299,7 +299,8 @@ private:
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg,
-                                std::span<const std::uint8_t> propose = {});
+                                std::span<const std::uint8_t> propose = {},
+                                bool sync = true);
   template<class Request>
   static bool RunIsolatedBatch(std::span<const Request> requests,
                                std::string* error_msg);
