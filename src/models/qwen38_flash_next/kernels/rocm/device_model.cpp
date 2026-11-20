@@ -586,6 +586,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   if (const char* selftest = std::getenv("GUFO_STRIX_Q4K_SELFTEST");
       selftest != nullptr && selftest[0] != '\0' && selftest[0] != '0') {
     const DeviceTensor* probe = nullptr;
+    const DeviceTensor* hc_probe = nullptr;
     const auto check_probe = [&](const DeviceTensor& t) {
       if (probe == nullptr && t.q4k != nullptr && t.cols % 256 == 0)
         probe = &t;
@@ -599,6 +600,13 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       check_probe(m->layers_[0].ssm_in);
       check_probe(m->layers_[0].ssm_out);
       check_probe(m->layers_[0].attn_qkv);
+      if (m->layers_[0].hc_attn.down.q4k != nullptr &&
+          m->layers_[0].hc_attn.down.cols % 256 == 0) {
+        hc_probe = &m->layers_[0].hc_attn.down;
+      } else if (m->has_mtp_ && m->mtp_.hc_attn.down.q4k != nullptr &&
+                 m->mtp_.hc_attn.down.cols % 256 == 0) {
+        hc_probe = &m->mtp_.hc_attn.down;
+      }
     }
     if (probe != nullptr &&
         qfn_mmq_q4_K_wmma_selftest(probe->q4k, static_cast<int>(probe->rows),
@@ -607,6 +615,26 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       if (error_msg != nullptr)
         *error_msg = "Q4_K WMMA selftest failed";
       return nullptr;
+    }
+    if (hc_probe != nullptr &&
+        qfn_mmq_q4_K_wmma_selftest(hc_probe->q4k,
+                                   static_cast<int>(hc_probe->rows),
+                                   static_cast<int>(hc_probe->cols),
+                                   nullptr) != 0) {
+      if (error_msg != nullptr)
+        *error_msg = "Q4_K HC down split-K WMMA selftest failed";
+      return nullptr;
+    }
+    if (!m->layers_.empty()) {
+      const auto& dn = m->layers_[0].ffn_down_exps;
+      if (qfn_mmq_moe_down_selftest(static_cast<int>(dn.type), dn.data,
+                                    static_cast<int>(dn.rows),
+                                    static_cast<int>(dn.cols),
+                                    static_cast<int>(dn.experts), nullptr) != 0) {
+        if (error_msg != nullptr)
+          *error_msg = "grouped MoE down selftest failed";
+        return nullptr;
+      }
     }
   }
   return m;

@@ -21,6 +21,11 @@ namespace {
 constexpr std::uint32_t kBatchSessions = 8;
 constexpr std::uint32_t kDecodeRows = 8;
 
+bool UnpaddedQ8(std::uint32_t k) noexcept {
+  return k % 32 == 0 &&
+         qfn_mmq_q8_1_bytes(1, static_cast<int>(k)) == k / 32 * 36;
+}
+
 bool WideBatchEnabled() noexcept {
   static const bool enabled = [] {
     const char* v = std::getenv("GUFO_STRIX_WIDE_BATCH");
@@ -221,26 +226,81 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
                           std::string* error) const {
   const auto& c = config();
   xn_half_ = false;
-  DropReadyQ8();  // the batched route rewrites xn and mixed unfused
-  if (!normed)
+  mixed_q8_ready_ = {};
+  if (!normed) {
+    xn_q8_ready_ = {};
+    q8t_src_ = nullptr;
     RmsNormRows(res, m.norm.f32(), s_.xn, rows, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
+  }
   if (!DenseBatch(m.down, s_.xn, s_.lo, rows, error))
     return false;
-  SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
-            std::size_t{rows} * c.hc_low_rank, stream_);
-  if (!DenseBatch(m.up, s_.lo, s_.hc_gate, rows, error))
-    return false;
+  const float scale = 1.0F / static_cast<float>(c.hc_count);
+  const bool wide = WideBatchEnabled();
+  const std::uint32_t lo_q8_cols = static_cast<std::uint32_t>(
+      qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hc_low_rank)) / 36 * 32);
+  bool up_done = false;
+  if (wide && m.up.type == core::GgmlType::kQ8_0 &&
+      m.up.cols == c.hc_low_rank) {
+    if (rows <= kDecodeRows &&
+        SiluScaleQ8_1(s_.lo, scale, rows, c.hc_low_rank, lo_q8_cols,
+                      s_.lo_q8_1, stream_)) {
+      if (!Dense(m.up, Q8Input{s_.lo, s_.lo_q8_1, rows, c.hc_low_rank},
+                 s_.hc_gate, error))
+        return false;
+      up_done = true;
+    } else if (rows > kDecodeRows) {
+      const auto padded = (rows + kDecodeRows - 1) / kDecodeRows * kDecodeRows;
+      if (qfn_mmq_q8_1_bytes(padded, c.hc_low_rank) <=
+              Q8TiledBytes(options_.max_batch, model_->max_q8_cols()) &&
+          SiluScaleQ8_1(s_.lo, scale, rows, c.hc_low_rank, lo_q8_cols,
+                        s_.x_q8t, stream_)) {
+        q8t_src_ = s_.lo;
+        q8t_rows_ = rows;
+        q8t_cols_ = c.hc_low_rank;
+        if (!DenseBatch(m.up, s_.lo, s_.hc_gate, rows, error))
+          return false;
+        up_done = true;
+      }
+    }
+  }
+  if (!up_done) {
+    SiluScale(s_.lo, scale, std::size_t{rows} * c.hc_low_rank, stream_);
+    if (!DenseBatch(m.up, s_.lo, s_.hc_gate, rows, error))
+      return false;
+  }
   const bool fused_inject = inject != nullptr && !m.inject.empty() &&
                             m.inject.type == core::GgmlType::kF32;
+  const bool separate_inject =
+      inject != nullptr && !m.inject.empty() && !fused_inject;
   q8t_src_ = nullptr;
   half_src_ = nullptr;
+  void* mixed_q8 = nullptr;
+  if (wide && UnpaddedQ8(c.hidden_size)) {
+    if (rows <= kDecodeRows) {
+      mixed_q8 = s_.mixed_q8_1;
+    } else if (!separate_inject) {
+      const auto padded = (rows + kDecodeRows - 1) / kDecodeRows * kDecodeRows;
+      if (qfn_mmq_q8_1_bytes(padded, c.hidden_size) <=
+          Q8TiledBytes(options_.max_batch, model_->max_q8_cols())) {
+        mixed_q8 = s_.x_q8t;
+      }
+    }
+  }
   // Keep each row's scalar epilogue/reduction independently of the total
   // row count, including prompt replay and concatenated decode batches.
   HcMixEpilogue(s_.xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
-                mixed, inject, rows, c.hidden_size, c.hc_count, stream_);
+                mixed, inject, rows, c.hidden_size, c.hc_count, stream_,
+                mixed_q8);
+  if (mixed_q8 == s_.mixed_q8_1) {
+    mixed_q8_ready_ = {mixed, s_.mixed_q8_1, rows, c.hidden_size};
+  } else if (mixed_q8 == s_.x_q8t) {
+    q8t_src_ = mixed;
+    q8t_rows_ = rows;
+    q8t_cols_ = c.hidden_size;
+  }
   inject_parts_ = fused_inject ? HcInjectParts(c.hidden_size) : 1;
-  if (inject != nullptr && !m.inject.empty() && !fused_inject) {
+  if (separate_inject) {
     if (!DenseBatch(m.inject, s_.xn, inject, rows, error))
       return false;
   }
@@ -251,6 +311,28 @@ void Executor::CombineBatch(float* res, const float* gamma,
                             std::uint32_t rows) const {
   const auto& c = config();
   DropReadyQ8();
+  q8t_src_ = nullptr;
+  if (WideBatchEnabled() && gamma != nullptr && UnpaddedQ8(c.HcDim())) {
+    if (rows <= kDecodeRows &&
+        HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
+                      s_.xn_q8_1, rows, c.hidden_size, c.hc_count, c.rms_eps,
+                      stream_)) {
+      xn_q8_ready_ = {s_.xn, s_.xn_q8_1, rows, c.HcDim()};
+      return;
+    }
+    const auto padded = (rows + kDecodeRows - 1) / kDecodeRows * kDecodeRows;
+    if (rows > kDecodeRows &&
+        qfn_mmq_q8_1_bytes(padded, c.HcDim()) <=
+            Q8TiledBytes(options_.max_batch, model_->max_q8_cols()) &&
+        HcCombineQ8_1(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn,
+                      s_.x_q8t, rows, c.hidden_size, c.hc_count, c.rms_eps,
+                      stream_)) {
+      q8t_src_ = s_.xn;
+      q8t_rows_ = rows;
+      q8t_cols_ = c.HcDim();
+      return;
+    }
+  }
   HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, rows,
             c.hidden_size, c.hc_count, c.rms_eps, stream_, true);
 }
@@ -651,6 +733,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                   stream_);
     }
     UseScratch(base);
+    DropReadyQ8();
     if (!HcMixBatch(head, nullptr, true, base.mixed, nullptr, n, error))
       return false;
     if (!AnyActive(items))
@@ -757,6 +840,10 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
 
 bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
                              std::uint32_t cols, std::string* error) const {
+  const bool wide = WideBatchEnabled();
+  if (wide && q8t_src_ == x && q8t_rows_ == rows && q8t_cols_ == cols) {
+    return true;
+  }
   // Quantize once for all independent rows. The prefill staging allocation
   // is idle during batch decoding; borrow it without adding another buffer.
   const auto padded = (rows + kDecodeRows - 1) / kDecodeRows * kDecodeRows;
@@ -765,15 +852,21 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
     return Fail(error, "batched projection exceeds activation scratch");
   void* quantized = s_.x_q8t;
   q8t_src_ = nullptr;
-  if (padded != rows &&
+  if (!wide && padded != rows &&
       !Check(
           hipMemsetAsync(static_cast<std::uint8_t*>(quantized) +
                              qfn_mmq_q8_1_bytes(rows, cols),
                          0, qfn_mmq_q8_1_bytes(padded - rows, cols), stream_),
           error))
     return false;
-  return qfn_mmq_quantize_q8_1(x, quantized, rows, cols, stream_) == 0 ||
-         Fail(error, "batched activation quantization failed");
+  if (qfn_mmq_quantize_q8_1(x, quantized, rows, cols, stream_) != 0)
+    return Fail(error, "batched activation quantization failed");
+  if (wide) {
+    q8t_src_ = x;
+    q8t_rows_ = rows;
+    q8t_cols_ = cols;
+  }
+  return true;
 }
 
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
@@ -781,8 +874,13 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   if (rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
   if (w.type != core::GgmlType::kQ8_0) {
-    SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
-              stream_);
+    if (WideBatchEnabled()) {
+      SmallGemmWide(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
+                    stream_);
+    } else {
+      SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
+                stream_);
+    }
     return true;
   }
   if (!QuantizeBatch(x, rows, w.cols, error))
@@ -1164,18 +1262,20 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         prof.layers[il].linear = l.linear;
         prof.layers[il].base = prof.Mark();  // layer start (before PLE)
       }
-      if (c.IsPleLayer(il) && !WaitPle(error))
-        return false;
-      for (std::size_t i = 0; i < items.size(); ++i) {
-        const auto& item = items[i];
-        const auto n = static_cast<std::uint32_t>(item.tokens.size());
-        UseScratch(RowScratch(base, offsets[i]));
-        if (!item.session->Cancelled() && c.IsPleLayer(il) &&
-            !Ple(l, *item.session, n, s_.res, item.speculative, error, true)) {
+      if (c.IsPleLayer(il)) {
+        if (!WaitPle(error))
           return false;
+        for (std::size_t i = 0; i < items.size(); ++i) {
+          const auto& item = items[i];
+          const auto n = static_cast<std::uint32_t>(item.tokens.size());
+          UseScratch(RowScratch(base, offsets[i]));
+          if (!item.session->Cancelled() &&
+              !Ple(l, *item.session, n, s_.res, item.speculative, error, true)) {
+            return false;
+          }
         }
+        UseScratch(base);
       }
-      UseScratch(base);
       (void)prof.Mark();  // +1: before hc_attn
       if (!HcMixBatch(l.hc_attn, base.res, normed, base.mixed, base.inject,
                       rows, error))

@@ -1428,6 +1428,102 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
   }
 }
 
+template<WeightType type, bool kWhole = false>
+__launch_bounds__(kSmallGemmRows * 32) __global__
+    void SmallGemmWide16Kernel(const void* __restrict__ w,
+                               const float* __restrict__ x,
+                               float* __restrict__ out, std::uint32_t n_tokens,
+                               std::uint32_t m, std::uint32_t k) {
+  const std::uint32_t lane = threadIdx.x % warpSize;
+  const std::uint32_t row =
+      blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (row >= m) {
+    return;
+  }
+  const std::uint32_t base_tok = blockIdx.y * 16;
+  const std::uint32_t valid = min(16U, n_tokens - base_tok);
+  const auto* wrow =
+      static_cast<const std::uint8_t*>(w) + RowBytes(type, k) * row;
+  constexpr unsigned kSteps = 2;
+  const std::uint32_t stride = warpSize * 4;
+  float acc[16] = {};
+  for (std::uint32_t i_base = lane * 4; i_base < k; i_base += stride * kSteps) {
+    float wv[kSteps][4];
+#pragma unroll
+    for (unsigned st = 0; st < kSteps; ++st) {
+      const std::uint32_t i0 = i_base + st * stride;
+      if constexpr (kWhole) {
+        if constexpr (type == WeightType::kF32) {
+          const float4 w4 = reinterpret_cast<const float4*>(
+              static_cast<const void*>(wrow))[i0 / 4];
+          wv[st][0] = w4.x;
+          wv[st][1] = w4.y;
+          wv[st][2] = w4.z;
+          wv[st][3] = w4.w;
+        } else {
+          static_assert(type == WeightType::kF16 || type == WeightType::kBF16);
+          const ushort4 h4 = reinterpret_cast<const ushort4*>(
+              static_cast<const void*>(wrow))[i0 / 4];
+          if constexpr (type == WeightType::kBF16) {
+            wv[st][0] = Bf16ToF32(h4.x);
+            wv[st][1] = Bf16ToF32(h4.y);
+            wv[st][2] = Bf16ToF32(h4.z);
+            wv[st][3] = Bf16ToF32(h4.w);
+          } else {
+            wv[st][0] = __half2float(__ushort_as_half(h4.x));
+            wv[st][1] = __half2float(__ushort_as_half(h4.y));
+            wv[st][2] = __half2float(__ushort_as_half(h4.z));
+            wv[st][3] = __half2float(__ushort_as_half(h4.w));
+          }
+        }
+      } else {
+#pragma unroll
+        for (unsigned r = 0; r < 4; ++r) {
+          wv[st][r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
+        }
+      }
+    }
+    for (unsigned j = 0; j < 16; ++j) {
+      const std::uint32_t tok = base_tok + (j < valid ? j : 0U);
+      const float* x_tok = x + static_cast<std::size_t>(tok) * k;
+#pragma unroll
+      for (unsigned st = 0; st < kSteps; ++st) {
+        const std::uint32_t i0 = i_base + st * stride;
+        if (!kWhole && i0 >= k) {
+          break;
+        }
+        float xv[4];
+        if constexpr (kWhole) {
+          const float4 x4 = reinterpret_cast<const float4*>(x_tok)[i0 / 4];
+          xv[0] = x4.x;
+          xv[1] = x4.y;
+          xv[2] = x4.z;
+          xv[3] = x4.w;
+        } else {
+          const float* xr = x_tok + i0;
+#pragma unroll
+          for (unsigned r = 0; r < 4; ++r) {
+            xv[r] = i0 + r < k ? xr[r] : 0.0f;
+          }
+        }
+        float dot = 0.0f;
+#pragma unroll
+        for (unsigned r = 0; r < 4; ++r) {
+          dot += wv[st][r] * xv[r];
+        }
+        acc[j] = Materialize(acc[j] + dot);
+      }
+    }
+  }
+#pragma unroll
+  for (unsigned j = 0; j < 16; ++j) {
+    const float total = WaveSum(acc[j]);
+    if (lane == 0 && j < valid) {
+      out[static_cast<std::size_t>(base_tok + j) * m + row] = total;
+    }
+  }
+}
+
 __global__ void PleGateKernel(const float* key_n, const float* query_n,
                               const float* value, float* gated,
                               std::uint32_t hidden, std::uint32_t streams) {
@@ -7351,6 +7447,48 @@ void SmallGemm(const void* w, WeightType type, const float* x, float* out,
     case WeightType::kF16:
       return SmallGemmForType<WeightType::kF16>(w, x, out, n_tokens, m, k,
                                                 stream);
+    default:
+      throw std::logic_error("unsupported small projection format");
+  }
+}
+
+template<WeightType type>
+void SmallGemmWideForType(const void* w, const float* x, float* out,
+                          std::uint32_t n_tokens, std::uint32_t m,
+                          std::uint32_t k, hipStream_t stream) {
+  if (n_tokens <= 8) {
+    return SmallGemmForType<type>(w, x, out, n_tokens, m, k, stream);
+  }
+  const dim3 grid((m + kSmallGemmRows - 1) / kSmallGemmRows,
+                  (n_tokens + 15) / 16);
+  const bool aligned = (reinterpret_cast<std::uintptr_t>(w) |
+                        reinterpret_cast<std::uintptr_t>(x)) %
+                           16 ==
+                       0;
+  if (aligned && k % (32 * 4 * 2) == 0) {
+    hipLaunchKernelGGL((SmallGemmWide16Kernel<type, true>), grid,
+                       dim3(kSmallGemmRows * 32), 0, stream, w, x, out,
+                       n_tokens, m, k);
+  } else {
+    hipLaunchKernelGGL((SmallGemmWide16Kernel<type, false>), grid,
+                       dim3(kSmallGemmRows * 32), 0, stream, w, x, out,
+                       n_tokens, m, k);
+  }
+}
+
+void SmallGemmWide(const void* w, WeightType type, const float* x, float* out,
+                   std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                   hipStream_t stream) {
+  switch (type) {
+    case WeightType::kF32:
+      return SmallGemmWideForType<WeightType::kF32>(w, x, out, n_tokens, m, k,
+                                                    stream);
+    case WeightType::kBF16:
+      return SmallGemmWideForType<WeightType::kBF16>(w, x, out, n_tokens, m, k,
+                                                     stream);
+    case WeightType::kF16:
+      return SmallGemmWideForType<WeightType::kF16>(w, x, out, n_tokens, m, k,
+                                                    stream);
     default:
       throw std::logic_error("unsupported small projection format");
   }

@@ -75,6 +75,9 @@ struct StrixMtpGateConfig {
   float samp_gate{kMtpSampledGateProbability};
   float greedy_drop{kMtpBatchDropProbability};
   float samp_drop{0.0F};
+  float cum_gate{0.0F};
+  float cum_drop{0.0F};
+  float cum_gate_c1{0.0F};
   std::uint32_t max_c2{0};
   std::uint32_t max_c3{0};
 };
@@ -135,14 +138,18 @@ const StrixMtpGateConfig& StrixMtpGateConfigValues() {
     c.samp_gate = flt("GUFO_STRIX_MTP_SAMP_GATE", kMtpSampledGateProbability);
     c.greedy_drop = flt("GUFO_STRIX_MTP_GREEDY_DROP", kMtpBatchDropProbability);
     c.samp_drop = flt("GUFO_STRIX_MTP_SAMP_DROP", 0.0F);
+    c.cum_gate = flt("GUFO_STRIX_MTP_CUM_GATE", 0.0F);
+    c.cum_drop = flt("GUFO_STRIX_MTP_CUM_DROP", 0.0F);
+    c.cum_gate_c1 = flt("GUFO_STRIX_MTP_CUM_GATE_C1", 0.0F);
     c.max_c2 = u32("GUFO_STRIX_MTP_MAX_C2", 0);
     c.max_c3 = u32("GUFO_STRIX_MTP_MAX_C3", 0);
     if (c.enabled) {
       std::fprintf(stderr,
                    "strix-mtp-gate: greedy=%.2f samp=%.2f greedy_drop=%.2f "
-                   "samp_drop=%.2f max_c2=%u max_c3=%u\n",
+                   "samp_drop=%.2f cum_gate=%.2f cum_drop=%.2f "
+                   "max_c2=%u max_c3=%u\n",
                    c.greedy_gate, c.samp_gate, c.greedy_drop, c.samp_drop,
-                   c.max_c2, c.max_c3);
+                   c.cum_gate, c.cum_drop, c.max_c2, c.max_c3);
     }
     return c;
   }();
@@ -965,6 +972,7 @@ struct Session::PendingDecode {
   std::size_t width{0};
   /// The chain stops after a proposal below its gate (GateStops).
   bool gated{false};
+  float cum_prob{1.0F};
   float draft_confidence{1.0F};
   std::optional<sampling::SamplerState> draft_sampler;
   std::uint64_t draft_rng{0};
@@ -997,6 +1005,9 @@ void Session::AppendDraft(PendingDecode& pending) {
         pending.candidates, *pending.draft_sampler, &pending.draft_rng));
     pending.draft = static_cast<std::int32_t>(pending.proposals.back().token);
     pending.draft_sampler->Accept(pending.proposals.back().token);
+    pending.cum_prob *= pending.proposals.back().probability;
+  } else {
+    pending.cum_prob *= pending.draft_confidence;
   }
   pending.chain.push_back(pending.draft);
 }
@@ -1198,7 +1209,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       if (AppendLookup(*pending, stop_at_eos)) {
         break;
       }
-      if (GateStops(*pending)) {
+      if (GateStops(*pending) ||
+          (pending->gated && gate_cfg.cum_gate_c1 > 0.0F &&
+           pending->cum_prob < gate_cfg.cum_gate_c1)) {
         if (pending->sampled && gate_cfg.samp_drop > 0.0F &&
             pending->chain.size() > 2 &&
             pending->proposals.back().probability < gate_cfg.samp_drop) {
@@ -1572,6 +1585,9 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   auto& exec = *requests.front().session->model_->executor_;
   std::optional<std::uint32_t> batch_drafts;
   std::uint32_t batch_context = 0;
+  for (const auto& r : requests) {
+    batch_context = std::max(batch_context, r.session->Position());
+  }
   auto& policy = requests.front().session->model_->batch_policy_;
   if (std::ranges::all_of(
           requests, [](const auto& r) { return r.session->MtpEnabled(); }) &&
@@ -1587,7 +1603,6 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
                  static_cast<std::uint32_t>(
                      std::min<std::size_t>(cap, exec.max_speculative())) -
                      (cap != 0)};
-      batch_context = std::max(batch_context, r.session->Position());
     }
     batch_drafts =
         policy.Choose(std::span(rows).first(requests.size()), batch_context);
@@ -1682,15 +1697,19 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       }
       if (session.AppendLookup(p, requests[i].stop_at_eos))
         continue;
-      if (GateStops(p)) {
-        const auto& cfg = StrixMtpGateConfigValues();
+      const auto& cfg = StrixMtpGateConfigValues();
+      const bool cum_stop =
+          p.gated && cfg.cum_gate > 0.0F && p.cum_prob < cfg.cum_gate;
+      if (GateStops(p) || cum_stop) {
         const bool drop_greedy =
             batch_drafts && !p.sampled && p.draft_confidence < cfg.greedy_drop;
         const bool drop_sampled =
             p.sampled && cfg.samp_drop > 0.0F &&
             p.proposals.back().probability < cfg.samp_drop &&
             (requests.size() >= 2 ? p.chain.size() >= 2 : p.chain.size() > 2);
-        if (drop_greedy || drop_sampled) {
+        const bool drop_cum = p.gated && cfg.cum_drop > 0.0F &&
+                              p.cum_prob < cfg.cum_drop && p.chain.size() >= 2;
+        if (drop_greedy || drop_sampled || drop_cum) {
           p.chain.pop_back();
           if (p.sampled)
             p.proposals.pop_back();
