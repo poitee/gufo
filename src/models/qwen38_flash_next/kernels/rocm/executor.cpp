@@ -28,6 +28,14 @@ namespace {
 
 using core::GgmlType;
 
+bool WideBatchEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_WIDE_BATCH");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
 void AssignError(std::string* error_msg, const std::string& message) {
   if (error_msg != nullptr) {
     *error_msg = message;
@@ -3370,18 +3378,48 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     const std::size_t conv_elems =
         static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
     const std::size_t slot = keep - 1;
-    for (auto& l : session.linear_) {
-      if (l.state == nullptr) {
-        continue;
-      }
-      RestoreGdnState(l.state, l.state_snapshots, keep, c.ssm_num_k_heads,
-                      c.ssm_num_v_heads, stream_);
-      if (!Check(hipGetLastError(), "state rollback", error_msg) ||
-          !Check(hipMemcpyAsync(l.conv_state, l.conv_snapshots.rows[slot],
-                                conv_elems * sizeof(float),
-                                hipMemcpyDeviceToDevice, stream_),
-                 "conv rollback", error_msg)) {
+    if (WideBatchEnabled() && c.ssm_head_dim == 128 &&
+        c.ssm_num_v_heads % 2 == 0) {
+      const std::size_t desc_bytes = c.num_layers * sizeof(GdnRollbackLayer);
+      if ((rollback_layers_host_ == nullptr &&
+           !Check(host_allocations_.Allocate(&rollback_layers_host_, desc_bytes,
+                                             hipHostMallocMapped),
+                  "GDN rollback table allocation", error_msg)) ||
+          (rollback_layers_ == nullptr &&
+           !Check(hipHostGetDevicePointer(
+                      reinterpret_cast<void**>(&rollback_layers_),
+                      rollback_layers_host_, 0),
+                  "GDN rollback table pointer", error_msg))) {
         return false;
+      }
+      std::uint32_t linear_count = 0;
+      for (auto& l : session.linear_) {
+        if (l.state == nullptr) {
+          continue;
+        }
+        rollback_layers_host_[linear_count++] = {
+            l.state, l.state_snapshots, l.conv_state,
+            l.conv_snapshots.rows[slot]};
+      }
+      RestoreGdnSession(rollback_layers_, linear_count, keep, c.ssm_num_k_heads,
+                        c.ssm_num_v_heads, conv_elems, stream_);
+      if (!Check(hipGetLastError(), "fused GDN rollback", error_msg)) {
+        return false;
+      }
+    } else {
+      for (auto& l : session.linear_) {
+        if (l.state == nullptr) {
+          continue;
+        }
+        RestoreGdnState(l.state, l.state_snapshots, keep, c.ssm_num_k_heads,
+                        c.ssm_num_v_heads, stream_);
+        if (!Check(hipGetLastError(), "state rollback", error_msg) ||
+            !Check(hipMemcpyAsync(l.conv_state, l.conv_snapshots.rows[slot],
+                                  conv_elems * sizeof(float),
+                                  hipMemcpyDeviceToDevice, stream_),
+                   "conv rollback", error_msg)) {
+          return false;
+        }
       }
     }
     if (session.ple_history_ != nullptr) {
@@ -4208,7 +4246,8 @@ bool Executor::CanCompactMtpVerification(
          std::size_t(config.top_k) <= kMtpCandidates &&
          config.min_keep <= kMtpCandidates &&
          sampler.penalties().size() + 8 <= kCompactPenaltyLimit &&
-         !sampler.NeedsConstraintMask();
+         (WideBatchEnabled() ? !sampler.ForcedToken().has_value()
+                             : !sampler.NeedsConstraintMask());
 }
 
 bool Executor::SampledMtpCandidates(

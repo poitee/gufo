@@ -36,6 +36,17 @@ void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
                      std::uint32_t k_heads, std::uint32_t v_heads,
                      hipStream_t stream);
 
+struct GdnRollbackLayer {
+  float* state;
+  RollbackRows state_snapshots;
+  float* conv_state;
+  const float* conv_snapshot;
+};
+void RestoreGdnSession(const GdnRollbackLayer* layers,
+                       std::uint32_t num_layers, std::uint32_t keep,
+                       std::uint32_t k_heads, std::uint32_t v_heads,
+                       std::size_t conv_elems, hipStream_t stream);
+
 /// GGUF type ids the runtime accepts for the small-matrix and lookup paths.
 enum class WeightType : std::uint32_t {
   kF32 = 0,
@@ -299,11 +310,6 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                hipStream_t stream);
-/// Single-pass F32/BF16/F16 projection reading weights once per 16 tokens while
-/// retaining SmallGemmKernel's exact accumulation order.
-void SmallGemmWide(const void* w, WeightType type, const float* x, float* out,
-                   std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
-                   hipStream_t stream);
 
 /// PLE gate: for every stream s, sc = dot(key_n[t][s], query_n[t][s]) /
 /// sqrt(hidden); gated[t][s][i] = value[t][i] * sigmoid(sgn(sc) *

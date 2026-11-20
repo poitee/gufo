@@ -667,6 +667,15 @@ SamplingDistribution SamplerState::Distribution(
       throw std::invalid_argument("forced token exceeds vocabulary");
     return SamplingDistribution({{*forced, 1.0}}, 1.0);
   }
+  if (config_.constraint) {
+    if (config_.temperature == 0.0F) {
+      config_.Validate();
+      return SamplingDistribution({{SampleConstrainedGreedy(logits), 1.0}},
+                                  1.0);
+    }
+    if (config_.top_k > 0)
+      return DistributionConstrainedTopK(logits);
+  }
   if (NeedsConstraintMask()) {
     if (config_.temperature == 0) {
       config_.Validate();
@@ -731,6 +740,152 @@ SamplingDistribution SamplerState::DistributionFromCandidates(
   return working.SelectedDistribution();
 }
 
+std::optional<SamplingDistribution> SamplerState::TryDistributionFromCandidates(
+    std::span<const LogitCandidate> logits,
+    std::size_t unpenalized_count) const {
+  config_.Validate();
+  if (const auto forced = ForcedToken()) {
+    return SamplingDistribution({{*forced, 1.0}}, 1.0);
+  }
+  if (config_.temperature <= 0.0F || config_.top_k <= 0)
+    return std::nullopt;
+  if (!config_.constraint)
+    return DistributionFromCandidates(logits);
+  if (unpenalized_count == 0 || logits.size() < unpenalized_count)
+    return std::nullopt;
+  const std::size_t keep = std::max<std::size_t>(
+      static_cast<std::size_t>(config_.top_k),
+      std::max<std::size_t>(config_.min_keep, 1));
+  bool saw_empty = false;
+  double floor_logit = std::numeric_limits<double>::infinity();
+  for (std::size_t i = 0; i < unpenalized_count; ++i) {
+    if (logits[i].token == UINT32_MAX || !std::isfinite(logits[i].value)) {
+      saw_empty = true;
+      break;
+    }
+    floor_logit = std::min(floor_logit, static_cast<double>(logits[i].value));
+  }
+  if (saw_empty)
+    floor_logit = -std::numeric_limits<double>::infinity();
+  const auto& vocab = *config_.constraint->vocabulary;
+  const auto& grammar = *config_.constraint->grammar;
+  const std::uint8_t* mask_data =
+      constraint_mask_ ? constraint_mask_->data() : nullptr;
+  const std::size_t mask_size = constraint_mask_ ? constraint_mask_->size() : 0;
+  auto working = *this;
+  auto& candidates = working.candidate_scratch_;
+  candidates.clear();
+  candidates.reserve(std::min<std::size_t>(logits.size(), 128));
+  for (const auto& c : logits) {
+    if (c.token == UINT32_MAX || !std::isfinite(c.value))
+      continue;
+    if (c.token >= vocab.size())
+      throw std::invalid_argument("invalid compact token ID");
+    const double adjusted = penalty_counts_.empty()
+                                ? static_cast<double>(c.value)
+                                : AdjustedLogit(c.token, c.value);
+    if (!saw_empty && std::isfinite(adjusted) && adjusted <= floor_logit)
+      continue;
+    const bool allowed =
+        mask_data != nullptr
+            ? (c.token < mask_size && mask_data[c.token] != 0)
+            : vocab.Allows(grammar, constraint_state_, c.token);
+    if (!allowed)
+      continue;
+    if (!std::isfinite(adjusted))
+      throw std::runtime_error(
+          "sampling penalties produced a non-finite logit");
+    candidates.push_back({c.token, adjusted});
+  }
+  if (candidates.empty() || (!saw_empty && candidates.size() < keep))
+    return std::nullopt;
+  const auto final_keep = std::min(candidates.size(), keep);
+  std::partial_sort(
+      candidates.begin(),
+      candidates.begin() + static_cast<std::ptrdiff_t>(final_keep),
+      candidates.end(), IsBetterProbability);
+  candidates.resize(final_keep);
+  working.FilterSelected(0.0, false);
+  return working.SelectedDistribution();
+}
+
+SamplingDistribution SamplerState::DistributionConstrainedTopK(
+    std::span<const float> logits) const {
+  config_.Validate();
+  if (logits.empty() || logits.size() > std::numeric_limits<TokenId>::max())
+    throw std::invalid_argument("invalid sampling vocabulary size");
+  const auto& vocab = *config_.constraint->vocabulary;
+  const auto& grammar = *config_.constraint->grammar;
+  if (logits.size() != vocab.size())
+    throw std::invalid_argument(
+        "JSON constraint vocabulary differs from logits");
+  const std::size_t limit =
+      std::min(logits.size(),
+               std::max<std::size_t>(
+                   static_cast<std::size_t>(config_.top_k),
+                   std::max<std::size_t>(config_.min_keep, 1)));
+  auto working = *this;
+  auto& heap = working.candidate_scratch_;
+  heap.clear();
+  heap.reserve(limit);
+  std::shared_ptr<const std::vector<std::uint8_t>> mask = constraint_mask_;
+  std::size_t allows_calls = 0;
+  const auto is_allowed = [&](TokenId token) {
+    if (mask)
+      return (*mask)[token] != 0;
+    if (++allows_calls > 512) {
+      mask = config_.constraint->Allowed(constraint_state_);
+      return (*mask)[token] != 0;
+    }
+    return vocab.Allows(grammar, constraint_state_, token);
+  };
+  auto penalty = penalty_counts_.begin();
+  for (std::size_t begin = 0; begin < logits.size(); begin += kSkipBlock) {
+    const std::size_t end = std::min(begin + kSkipBlock, logits.size());
+    while (penalty != penalty_counts_.end() && penalty->token < begin)
+      ++penalty;
+    if (heap.size() == limit &&
+        (penalty == penalty_counts_.end() || penalty->token >= end)) {
+      const float maximum = BlockMaximum(logits.subspan(begin, end - begin));
+      if (static_cast<double>(maximum) <= heap.front().value)
+        continue;
+    }
+    for (std::size_t index = begin; index < end; ++index) {
+      if (!std::isfinite(logits[index]))
+        continue;
+      while (penalty != penalty_counts_.end() && penalty->token < index)
+        ++penalty;
+      const double adjusted =
+          penalty != penalty_counts_.end() && penalty->token == index
+              ? Penalize(logits[index], config_, *penalty)
+              : static_cast<double>(logits[index]);
+      const auto token = static_cast<TokenId>(index);
+      if (heap.size() == limit && std::isfinite(adjusted) &&
+          !IsBetterProbability({token, adjusted}, heap.front()))
+        continue;
+      if (!is_allowed(token))
+        continue;
+      if (!std::isfinite(adjusted))
+        throw std::runtime_error(
+            "sampling penalties produced a non-finite logit");
+      const Probability candidate{token, adjusted};
+      if (heap.size() < limit) {
+        heap.push_back(candidate);
+        std::push_heap(heap.begin(), heap.end(), IsBetterProbability);
+      } else if (IsBetterProbability(candidate, heap.front())) {
+        std::pop_heap(heap.begin(), heap.end(), IsBetterProbability);
+        heap.back() = candidate;
+        std::push_heap(heap.begin(), heap.end(), IsBetterProbability);
+      }
+    }
+  }
+  if (heap.empty())
+    throw std::runtime_error("logit distribution contains no finite values");
+  std::ranges::sort(heap, IsBetterProbability);
+  working.FilterSelected(0.0, false);
+  return working.SelectedDistribution();
+}
+
 SamplingDistribution SamplerState::Distribution(
     std::span<const float> logits, std::span<const TokenId> token_ids) const {
   if (const auto forced = ForcedToken()) {
@@ -792,9 +947,18 @@ TokenId SamplerState::Sample(std::span<const float> logits) {
       throw std::invalid_argument("pending sample exceeds vocabulary");
     }
     const auto token = *pending_sample_;
-    if (config_.constraint &&
-        !config_.constraint->Allowed(constraint_state_)->at(token))
-      throw std::runtime_error("pending sample violates JSON constraint");
+    if (config_.constraint) {
+      if (token >= config_.constraint->vocabulary->size())
+        throw std::invalid_argument(
+            "JSON constraint vocabulary differs from logits");
+      const bool allowed =
+          constraint_mask_
+              ? (*constraint_mask_)[token] != 0
+              : config_.constraint->vocabulary->Allows(
+                    *config_.constraint->grammar, constraint_state_, token);
+      if (!allowed)
+        throw std::runtime_error("pending sample violates JSON constraint");
+    }
     pending_sample_.reset();
     return token;
   }
@@ -906,7 +1070,19 @@ TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
 
 TokenId SamplerState::SampleConstrainedGreedy(
     std::span<const float> logits) const {
-  const auto mask = config_.constraint->Allowed(constraint_state_);
+  if (logits.size() != config_.constraint->vocabulary->size())
+    throw std::invalid_argument(
+        "JSON constraint vocabulary differs from logits");
+  if (!constraint_mask_) {
+    const TokenId greedy = SampleGreedy(logits);
+    if (config_.constraint->vocabulary->Allows(*config_.constraint->grammar,
+                                               constraint_state_, greedy)) {
+      return greedy;
+    }
+  }
+  const auto mask = constraint_mask_
+                        ? constraint_mask_
+                        : config_.constraint->Allowed(constraint_state_);
   if (logits.size() != mask->size())
     throw std::invalid_argument(
         "JSON constraint vocabulary differs from logits");

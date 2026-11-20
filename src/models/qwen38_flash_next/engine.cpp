@@ -101,7 +101,10 @@ bool ProfileEnabled() noexcept {
 struct RoundProfState {
   std::mutex mu;
   int rounds{0};
-  double total{0}, catchup{0}, heads{0}, bodies{0}, fwd{0}, finish{0};
+  double total{0}, prep{0}, catchup{0}, heads{0}, bodies{0}, fwd{0},
+      finish{0};
+  double fin_cand{0}, fin_ver{0}, fin_rb{0};
+  int fin_fb{0};
   double reqs{0}, rows{0}, steps{0};
 };
 
@@ -1238,7 +1241,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
 
 bool Session::FinishDecode(const DecodeRequest& request,
                            const PendingDecode& pending,
-                           std::string* error_msg) {
+                           std::string* error_msg, FinishProf* prof) {
   auto& sampler = *request.sampler;
   auto* result = request.result;
   auto& exec = *model_->executor_;
@@ -1262,6 +1265,10 @@ bool Session::FinishDecode(const DecodeRequest& request,
     result->tokens.push_back(anchor);
     return true;
   }
+  const auto prof_ms = [](auto a, auto b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  const auto t_cand0 = std::chrono::steady_clock::now();
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
   std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens> greedy{};
   if (gpu_greedy &&
@@ -1287,6 +1294,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
     // Accepting the anchor may activate a tool grammar, reasoning budget,
     // or exceed the bounded penalty workspace. Keep the complete-row path.
     if (!rocm::Executor::CanCompactMtpVerification(sampler)) {
+      if (prof)
+        ++prof->fb;
       if (!download_remaining(0))
         return false;
     } else if (!exec.SampledMtpCandidates(std::span(candidates).first(k - 1),
@@ -1295,6 +1304,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
       return false;
     }
   }
+  const auto t_ver0 = std::chrono::steady_clock::now();
+  if (prof)
+    prof->cand += prof_ms(t_cand0, t_ver0);
   while (keep < k) {
     if (gpu_greedy && !cpu_rows) {
       const auto& prediction = greedy[keep - 1];
@@ -1324,16 +1336,33 @@ bool Session::FinishDecode(const DecodeRequest& request,
       continue;
     }
     if (sampled) {
-      if (gpu_verification && !cpu_rows && sampler.NeedsConstraintMask() &&
-          !download_remaining(keep - 1))
+      std::optional<MtpVerification> compact;
+      if (WideBatchEnabled() && gpu_verification && !cpu_rows) {
+        compact = TryVerifyMtpProposal(candidates[keep - 1], kMtpCandidates,
+                                       vocab, proposals[keep - 1], sampler);
+        if (!compact) {
+          if (prof)
+            ++prof->fb;
+          verify_logits_.resize(exec.max_speculative() * vocab);
+          auto row =
+              std::span(verify_logits_).subspan((keep - 1) * vocab, vocab);
+          if (!exec.ReadVerificationRows(keep - 1, row, error_msg))
+            return false;
+          compact = VerifyMtpProposal(row, proposals[keep - 1], sampler);
+        }
+      } else if (gpu_verification && !cpu_rows &&
+                 sampler.NeedsConstraintMask() &&
+                 !download_remaining(keep - 1)) {
         return false;
+      }
       const auto verified =
-          gpu_verification && !cpu_rows
-              ? VerifyMtpProposal(candidates[keep - 1], vocab,
-                                  proposals[keep - 1], sampler)
-              : VerifyMtpProposal(std::span<const float>(verify_logits_)
-                                      .subspan((keep - 1) * vocab, vocab),
-                                  proposals[keep - 1], sampler);
+          compact ? *compact
+          : (gpu_verification && !cpu_rows
+                 ? VerifyMtpProposal(candidates[keep - 1], vocab,
+                                     proposals[keep - 1], sampler)
+                 : VerifyMtpProposal(std::span<const float>(verify_logits_)
+                                         .subspan((keep - 1) * vocab, vocab),
+                                     proposals[keep - 1], sampler));
       const auto token = static_cast<std::int32_t>(verified.token);
       const bool accepted = verified.accepted;
       if (is_stop(token)) {
@@ -1357,6 +1386,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
     }
     ++keep;
   }
+  const auto t_rb0 = std::chrono::steady_clock::now();
+  if (prof)
+    prof->ver += prof_ms(t_ver0, t_rb0);
   if (!exec.Rollback(
           *session_, keep, error_msg,
           gpu_verification && !cpu_rows ? logits_.data() : nullptr)) {
@@ -1366,6 +1398,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
     std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
                 logits_.begin());
   }
+  if (prof)
+    prof->rb += prof_ms(t_rb0, std::chrono::steady_clock::now());
   hidden_base_ = base;
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
   result->tokens.assign(chain.begin(), chain.begin() + keep);
@@ -1617,9 +1651,12 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   const auto now_ms = [](auto a, auto b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
   };
-  double p_catchup = 0, p_heads = 0, p_bodies = 0, p_fwd = 0, p_finish = 0;
+  double p_prep = 0, p_catchup = 0, p_heads = 0, p_bodies = 0, p_fwd = 0,
+         p_finish = 0;
+  FinishProf fprof{};
   int p_steps = 0;
   std::vector<PendingDecode> pending(requests.size());
+  const auto t_p0 = std::chrono::steady_clock::now();
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& r = requests[i];
     try {
@@ -1632,6 +1669,8 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       pending[i] = {};
     }
   }
+  if (prof_round)
+    p_prep = now_ms(t_p0, std::chrono::steady_clock::now());
   std::vector<AdvanceRequest> catchup;
   std::vector<std::uint8_t> propose;
   for (std::size_t i = 0; i < requests.size(); ++i) {
@@ -1793,10 +1832,14 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
                     : p.gpu_verification ? nullptr
                                          : session.verify_logits_.data();
     try {
+      const auto t_sel0 = std::chrono::steady_clock::now();
+      const bool selected = exec.SelectBatchLogits(
+          row_offset, p.chain.size(), logits, &r.outcome->error);
+      if (prof_round)
+        fprof.cand += now_ms(t_sel0, std::chrono::steady_clock::now());
       r.outcome->completed =
-          exec.SelectBatchLogits(row_offset, p.chain.size(), logits,
-                                 &r.outcome->error) &&
-          session.FinishDecode(r, p, &r.outcome->error);
+          selected && session.FinishDecode(r, p, &r.outcome->error,
+                                           prof_round ? &fprof : nullptr);
     } catch (const std::exception& exception) {
       r.outcome->error = exception.what();
     }
@@ -1808,11 +1851,16 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     std::lock_guard lock(rprof.mu);
     if (rprof.rounds < 25) {
       rprof.total += p_total;
+      rprof.prep += p_prep;
       rprof.catchup += p_catchup;
       rprof.heads += p_heads;
       rprof.bodies += p_bodies;
       rprof.fwd += p_fwd;
       rprof.finish += p_finish;
+      rprof.fin_cand += fprof.cand;
+      rprof.fin_ver += fprof.ver;
+      rprof.fin_rb += fprof.rb;
+      rprof.fin_fb += fprof.fb;
       rprof.reqs += static_cast<double>(requests.size());
       rprof.rows += static_cast<double>(offset);
       rprof.steps += static_cast<double>(p_steps);
@@ -1822,11 +1870,14 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
         std::fprintf(
             stderr,
             "strix-prof-round (n=25 avg_reqs=%.1f avg_rows=%.1f "
-            "avg_steps=%.1f): total=%.1fms | catchup=%.1f mtp_heads=%.1f "
-            "mtp_bodies=%.1f fwd=%.1f finish=%.1f\n",
+            "avg_steps=%.1f): total=%.1fms | prep=%.1f catchup=%.1f "
+            "mtp_heads=%.1f mtp_bodies=%.1f fwd=%.1f finish=%.1f "
+            "(cand=%.1f ver=%.1f rb=%.1f fb=%d)\n",
             rprof.reqs * inv, rprof.rows * inv, rprof.steps * inv,
-            rprof.total * inv, rprof.catchup * inv, rprof.heads * inv,
-            rprof.bodies * inv, rprof.fwd * inv, rprof.finish * inv);
+            rprof.total * inv, rprof.prep * inv, rprof.catchup * inv,
+            rprof.heads * inv, rprof.bodies * inv, rprof.fwd * inv,
+            rprof.finish * inv, rprof.fin_cand * inv, rprof.fin_ver * inv,
+            rprof.fin_rb * inv, rprof.fin_fb);
       }
     }
   }

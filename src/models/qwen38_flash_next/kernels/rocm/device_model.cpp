@@ -625,17 +625,6 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
         *error_msg = "Q4_K HC down split-K WMMA selftest failed";
       return nullptr;
     }
-    if (!m->layers_.empty()) {
-      const auto& dn = m->layers_[0].ffn_down_exps;
-      if (qfn_mmq_moe_down_selftest(static_cast<int>(dn.type), dn.data,
-                                    static_cast<int>(dn.rows),
-                                    static_cast<int>(dn.cols),
-                                    static_cast<int>(dn.experts), nullptr) != 0) {
-        if (error_msg != nullptr)
-          *error_msg = "grouped MoE down selftest failed";
-        return nullptr;
-      }
-    }
   }
   return m;
 }

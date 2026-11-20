@@ -1428,102 +1428,6 @@ __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
   }
 }
 
-template<WeightType type, bool kWhole = false>
-__launch_bounds__(kSmallGemmRows * 32) __global__
-    void SmallGemmWide16Kernel(const void* __restrict__ w,
-                               const float* __restrict__ x,
-                               float* __restrict__ out, std::uint32_t n_tokens,
-                               std::uint32_t m, std::uint32_t k) {
-  const std::uint32_t lane = threadIdx.x % warpSize;
-  const std::uint32_t row =
-      blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
-  if (row >= m) {
-    return;
-  }
-  const std::uint32_t base_tok = blockIdx.y * 16;
-  const std::uint32_t valid = min(16U, n_tokens - base_tok);
-  const auto* wrow =
-      static_cast<const std::uint8_t*>(w) + RowBytes(type, k) * row;
-  constexpr unsigned kSteps = 2;
-  const std::uint32_t stride = warpSize * 4;
-  float acc[16] = {};
-  for (std::uint32_t i_base = lane * 4; i_base < k; i_base += stride * kSteps) {
-    float wv[kSteps][4];
-#pragma unroll
-    for (unsigned st = 0; st < kSteps; ++st) {
-      const std::uint32_t i0 = i_base + st * stride;
-      if constexpr (kWhole) {
-        if constexpr (type == WeightType::kF32) {
-          const float4 w4 = reinterpret_cast<const float4*>(
-              static_cast<const void*>(wrow))[i0 / 4];
-          wv[st][0] = w4.x;
-          wv[st][1] = w4.y;
-          wv[st][2] = w4.z;
-          wv[st][3] = w4.w;
-        } else {
-          static_assert(type == WeightType::kF16 || type == WeightType::kBF16);
-          const ushort4 h4 = reinterpret_cast<const ushort4*>(
-              static_cast<const void*>(wrow))[i0 / 4];
-          if constexpr (type == WeightType::kBF16) {
-            wv[st][0] = Bf16ToF32(h4.x);
-            wv[st][1] = Bf16ToF32(h4.y);
-            wv[st][2] = Bf16ToF32(h4.z);
-            wv[st][3] = Bf16ToF32(h4.w);
-          } else {
-            wv[st][0] = __half2float(__ushort_as_half(h4.x));
-            wv[st][1] = __half2float(__ushort_as_half(h4.y));
-            wv[st][2] = __half2float(__ushort_as_half(h4.z));
-            wv[st][3] = __half2float(__ushort_as_half(h4.w));
-          }
-        }
-      } else {
-#pragma unroll
-        for (unsigned r = 0; r < 4; ++r) {
-          wv[st][r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
-        }
-      }
-    }
-    for (unsigned j = 0; j < 16; ++j) {
-      const std::uint32_t tok = base_tok + (j < valid ? j : 0U);
-      const float* x_tok = x + static_cast<std::size_t>(tok) * k;
-#pragma unroll
-      for (unsigned st = 0; st < kSteps; ++st) {
-        const std::uint32_t i0 = i_base + st * stride;
-        if (!kWhole && i0 >= k) {
-          break;
-        }
-        float xv[4];
-        if constexpr (kWhole) {
-          const float4 x4 = reinterpret_cast<const float4*>(x_tok)[i0 / 4];
-          xv[0] = x4.x;
-          xv[1] = x4.y;
-          xv[2] = x4.z;
-          xv[3] = x4.w;
-        } else {
-          const float* xr = x_tok + i0;
-#pragma unroll
-          for (unsigned r = 0; r < 4; ++r) {
-            xv[r] = i0 + r < k ? xr[r] : 0.0f;
-          }
-        }
-        float dot = 0.0f;
-#pragma unroll
-        for (unsigned r = 0; r < 4; ++r) {
-          dot += wv[st][r] * xv[r];
-        }
-        acc[j] = Materialize(acc[j] + dot);
-      }
-    }
-  }
-#pragma unroll
-  for (unsigned j = 0; j < 16; ++j) {
-    const float total = WaveSum(acc[j]);
-    if (lane == 0 && j < valid) {
-      out[static_cast<std::size_t>(base_tok + j) * m + row] = total;
-    }
-  }
-}
-
 __global__ void PleGateKernel(const float* key_n, const float* query_n,
                               const float* value, float* gated,
                               std::uint32_t hidden, std::uint32_t streams) {
@@ -2154,6 +2058,58 @@ __global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
                 : __fmaf_rn(beta, correction, __fmul_rn(value, decay));
   }
   state[i] = value;
+}
+
+__global__ void RestoreGdnSessionKernel(const GdnRollbackLayer* __restrict__ layers,
+                                        std::uint32_t keep,
+                                        std::uint32_t k_heads,
+                                        std::uint32_t v_heads) {
+  static_assert(kGdnDim == 128 && (kGdnDim / kGdnLanes) % 4 == 0);
+  const auto& layer = layers[blockIdx.y];
+  const std::size_t i4 = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  const std::size_t n4 = std::size_t{v_heads} * kGdnDim * (kGdnDim / 4);
+  if (i4 >= n4)
+    return;
+  const std::size_t i = i4 * 4;
+  const auto h = i / (kGdnDim * kGdnDim);
+  const auto j = (i / kGdnDim) % kGdnDim;
+  const auto k0 = i % kGdnDim;
+  const bool last_w = ((k0 + 4) % (kGdnDim / kGdnLanes)) == 0;
+  float4 val = reinterpret_cast<const float4*>(layer.state_snapshots.rows[0])[i4];
+  for (std::uint32_t t = 1; t < keep; ++t) {
+    const auto* update = layer.state_snapshots.rows[t];
+    const float4 kv = reinterpret_cast<const float4*>(
+        update + (h % k_heads) * kGdnDim)[k0 / 4];
+    const float decay = update[k_heads * kGdnDim + h];
+    const float beta = update[k_heads * kGdnDim + v_heads + h];
+    const float error =
+        update[k_heads * kGdnDim + 2 * v_heads + h * kGdnDim + j];
+    val.x = __fmaf_rn(beta, __fmul_rn(error, kv.x), __fmul_rn(val.x, decay));
+    val.y = __fmaf_rn(beta, __fmul_rn(error, kv.y), __fmul_rn(val.y, decay));
+    val.z = __fmaf_rn(beta, __fmul_rn(error, kv.z), __fmul_rn(val.z, decay));
+    val.w = last_w ? GdnLastUpdate(val.w, decay, error, kv.w, beta)
+                   : __fmaf_rn(beta, __fmul_rn(error, kv.w),
+                               __fmul_rn(val.w, decay));
+  }
+  reinterpret_cast<float4*>(layer.state)[i4] = val;
+}
+
+__global__ void RestoreConvSessionKernel(const GdnRollbackLayer* __restrict__ layers,
+                                         std::size_t conv_elems) {
+  const auto& layer = layers[blockIdx.y];
+  if (conv_elems % 4 == 0) {
+    const std::size_t i4 = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    const std::size_t n4 = conv_elems / 4;
+    if (i4 < n4) {
+      reinterpret_cast<float4*>(layer.conv_state)[i4] =
+          reinterpret_cast<const float4*>(layer.conv_snapshot)[i4];
+    }
+    return;
+  }
+  const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (i < conv_elems) {
+    layer.conv_state[i] = layer.conv_snapshot[i];
+  }
 }
 
 /// Per-head RMSNorm of the raw attention rows and the sigmoid output gate,
@@ -7452,48 +7408,6 @@ void SmallGemm(const void* w, WeightType type, const float* x, float* out,
   }
 }
 
-template<WeightType type>
-void SmallGemmWideForType(const void* w, const float* x, float* out,
-                          std::uint32_t n_tokens, std::uint32_t m,
-                          std::uint32_t k, hipStream_t stream) {
-  if (n_tokens <= 8) {
-    return SmallGemmForType<type>(w, x, out, n_tokens, m, k, stream);
-  }
-  const dim3 grid((m + kSmallGemmRows - 1) / kSmallGemmRows,
-                  (n_tokens + 15) / 16);
-  const bool aligned = (reinterpret_cast<std::uintptr_t>(w) |
-                        reinterpret_cast<std::uintptr_t>(x)) %
-                           16 ==
-                       0;
-  if (aligned && k % (32 * 4 * 2) == 0) {
-    hipLaunchKernelGGL((SmallGemmWide16Kernel<type, true>), grid,
-                       dim3(kSmallGemmRows * 32), 0, stream, w, x, out,
-                       n_tokens, m, k);
-  } else {
-    hipLaunchKernelGGL((SmallGemmWide16Kernel<type, false>), grid,
-                       dim3(kSmallGemmRows * 32), 0, stream, w, x, out,
-                       n_tokens, m, k);
-  }
-}
-
-void SmallGemmWide(const void* w, WeightType type, const float* x, float* out,
-                   std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
-                   hipStream_t stream) {
-  switch (type) {
-    case WeightType::kF32:
-      return SmallGemmWideForType<WeightType::kF32>(w, x, out, n_tokens, m, k,
-                                                    stream);
-    case WeightType::kBF16:
-      return SmallGemmWideForType<WeightType::kBF16>(w, x, out, n_tokens, m, k,
-                                                     stream);
-    case WeightType::kF16:
-      return SmallGemmWideForType<WeightType::kF16>(w, x, out, n_tokens, m, k,
-                                                    stream);
-    default:
-      throw std::logic_error("unsupported small projection format");
-  }
-}
-
 void PleGate(const float* key_n, const float* query_n, const float* value,
              float* gated, std::uint32_t n_tokens, std::uint32_t hidden,
              std::uint32_t streams, hipStream_t stream) {
@@ -7538,6 +7452,23 @@ void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
   const auto count = std::size_t{v_heads} * kGdnDim * kGdnDim;
   RestoreGdnStateKernel<<<(count + 255) / 256, 256, 0, stream>>>(
       state, snapshots, keep, k_heads, v_heads);
+}
+
+void RestoreGdnSession(const GdnRollbackLayer* layers,
+                       std::uint32_t num_layers, std::uint32_t keep,
+                       std::uint32_t k_heads, std::uint32_t v_heads,
+                       std::size_t conv_elems, hipStream_t stream) {
+  if (num_layers == 0)
+    return;
+  const std::size_t n4 = std::size_t{v_heads} * kGdnDim * (kGdnDim / 4);
+  RestoreGdnSessionKernel<<<dim3((n4 + 255) / 256, num_layers), 256, 0,
+                            stream>>>(layers, keep, k_heads, v_heads);
+  if (conv_elems != 0) {
+    const std::size_t conv_threads =
+        conv_elems % 4 == 0 ? conv_elems / 4 : conv_elems;
+    RestoreConvSessionKernel<<<dim3((conv_threads + 255) / 256, num_layers),
+                               256, 0, stream>>>(layers, conv_elems);
+  }
 }
 
 void HistoryPrefix(const float* in, std::uint32_t stride, const float* history,

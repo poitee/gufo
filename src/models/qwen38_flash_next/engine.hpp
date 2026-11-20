@@ -319,8 +319,14 @@ private:
   /// Appends copies within the prepared budget, stopping at EOG when enabled.
   bool AppendLookup(PendingDecode& pending, bool stop_at_eos,
                     std::size_t minimum = 1, bool require_resume = false);
+  struct FinishProf {
+    double cand{0};
+    double ver{0};
+    double rb{0};
+    int fb{0};
+  };
   bool FinishDecode(const DecodeRequest& request, const PendingDecode& pending,
-                    std::string* error_msg);
+                    std::string* error_msg, FinishProf* prof = nullptr);
 
   std::shared_ptr<Model> model_;
   std::unique_ptr<rocm::Session> session_;

@@ -723,6 +723,8 @@ private:
   // preparing the next layer. ForwardBatch drains before reusing this table.
   mutable GdnBatchItem* batch_gdn_host_{nullptr};
   mutable GdnBatchItem* batch_gdn_{nullptr};
+  mutable GdnRollbackLayer* rollback_layers_host_{nullptr};
+  mutable GdnRollbackLayer* rollback_layers_{nullptr};
   mutable std::uint32_t batch_rows_{0};
   mutable const float* selected_logits_{nullptr};
   [[nodiscard]] const float* VerificationLogits() const {

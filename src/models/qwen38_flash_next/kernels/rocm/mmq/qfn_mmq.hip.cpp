@@ -426,7 +426,7 @@ static int moe_vector_projection(int weight_type, const void* W,
       !gated && !W_b && !X_q8 &&
       (type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q8_0) && K == 640 &&
       n_expert_used == 1 && n_tokens > 1;
-  const bool grouped_down = by_expert && WideBatchWmma() && n_tokens <= 1024;
+  const bool grouped_down = false;
   const bool split_wide_gu =
       gated && n_tokens > MMVQ_MAX_BATCH_SIZE && WideBatchWmma();
   const size_t by_expert_bytes =

@@ -874,13 +874,8 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   if (rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
   if (w.type != core::GgmlType::kQ8_0) {
-    if (WideBatchEnabled()) {
-      SmallGemmWide(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
-                    stream_);
-    } else {
-      SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
-                stream_);
-    }
+    SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
+              stream_);
     return true;
   }
   if (!QuantizeBatch(x, rows, w.cols, error))

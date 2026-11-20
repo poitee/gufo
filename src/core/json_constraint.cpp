@@ -2507,9 +2507,9 @@ std::shared_ptr<const std::vector<std::uint8_t>> TokenConstraint::Allowed(
   const std::lock_guard lock(mutex_);
   if (const auto found = masks_.find(canonical); found != masks_.end())
     return found->second;
-  if (masks_.size() >= 16) {
+  if (masks_.size() >= 128) {
     // Every request needs the initial mask, even when the model state is
-    // cached. Keep it within the same 16-entry budget instead of rebuilding
+    // cached. Keep it within the same 128-entry budget instead of rebuilding
     // the entire vocabulary mask after each completed native call.
     auto victim = masks_.begin();
     if (victim->first == initial_state_)

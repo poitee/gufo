@@ -170,6 +170,15 @@ public:
   /// Retains the full-row sampler's FP64 filtering and normalization.
   [[nodiscard]] SamplingDistribution DistributionFromCandidates(
       std::span<const LogitCandidate> logits) const;
+  /// Exact target top-k from a compact GPU candidate union whose first
+  /// `unpenalized_count` entries are the global top unpenalized tokens and
+  /// whose tail holds all penalized tokens. Supports active constraints via
+  /// per-candidate Allows() checks without building a full vocabulary mask;
+  /// returns std::nullopt only if fewer than `keep` allowed candidates
+  /// strictly exceed the unpenalized floor logit.
+  [[nodiscard]] std::optional<SamplingDistribution>
+  TryDistributionFromCandidates(std::span<const LogitCandidate> logits,
+                                std::size_t unpenalized_count) const;
   /// Retain a speculative residual draw for the next Sample call. Copies
   /// preserve this draw along with the RNG; resetting history discards it.
   void DeferSample(TokenId token);
@@ -195,6 +204,8 @@ private:
   void FilterSelected(double full_softmax_sum = 0,
                       bool has_full_softmax_sum = false);
   [[nodiscard]] SamplingDistribution SelectedDistribution();
+  [[nodiscard]] SamplingDistribution DistributionConstrainedTopK(
+      std::span<const float> logits) const;
   void StartReasoning();
   void AdvanceReasoning(TokenId token);
 

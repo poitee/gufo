@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 
@@ -120,6 +121,18 @@ inline MtpVerification VerifyMtpProposal(
   return VerifyMtpTarget(vocab, proposal, sampler, [&] {
     return sampler.DistributionFromCandidates(candidates);
   });
+}
+
+inline std::optional<MtpVerification> TryVerifyMtpProposal(
+    std::span<const sampling::LogitCandidate> candidates,
+    std::size_t unpenalized_count, std::size_t vocab,
+    const MtpProposal& proposal, sampling::SamplerState& sampler) {
+  auto target =
+      sampler.TryDistributionFromCandidates(candidates, unpenalized_count);
+  if (!target)
+    return std::nullopt;
+  return VerifyMtpTarget(vocab, proposal, sampler,
+                         [&] { return std::move(*target); });
 }
 
 /// The draft is deterministic, so an exact target sample decides acceptance.
