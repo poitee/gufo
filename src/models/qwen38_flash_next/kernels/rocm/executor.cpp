@@ -1587,6 +1587,18 @@ bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
       AssignError(error_msg, "quantized input width mismatch");
       return false;
     }
+    if (w.q4k != nullptr && q.n <= kVecBatch) {
+      // Local experiment: the Q4_K copy as one routed expert.
+      if (qfn_mmq_moe_vec_preq(static_cast<int>(GgmlType::kQ4_K), w.q4k,
+                               q.data, model_->q4k_ids(), out,
+                               static_cast<int>(w.rows),
+                               static_cast<int>(w.cols), static_cast<int>(q.n),
+                               1, 1, stream_) != 0) {
+        AssignError(error_msg, "Q4_K dense projection failed");
+        return false;
+      }
+      return true;
+    }
     if (qfn_mmq_q8_0_dense_vec_preq(
             w.data, nullptr, q.data, out, static_cast<int>(w.rows),
             static_cast<int>(q.n), static_cast<int>(w.cols), stream_) != 0) {
@@ -4420,6 +4432,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     // Only K/V and pooled indexer keys survive this catch-up. Slice the
     // packed Q/gate/K/V weight without copying or changing its arithmetic.
     auto kv = l.attn_qkv;
+    kv.q4k = nullptr;  // the slice has no Q4_K copy
     const TensorRef layout{.type = kv.type, .cols = kv.cols};
     kv.data = static_cast<std::uint8_t*>(kv.data) +
               std::size_t{2} * c.AttentionQDim() * layout.RowBytes();

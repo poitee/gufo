@@ -508,6 +508,16 @@ extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
                                out_b, false);
 }
 
+extern "C" int qfn_mmq_moe_vec_preq(int weight_type, const void* W,
+                                    const void* X_q8, const int32_t* ids,
+                                    float* out_f32, int M, int K, int n_tokens,
+                                    int n_experts, int n_expert_used,
+                                    hipStream_t stream) {
+  return moe_vector_projection(weight_type, W, nullptr, ids, out_f32, M, K,
+                               n_tokens, n_experts, n_expert_used, stream,
+                               nullptr, nullptr, false, X_q8);
+}
+
 extern "C" int qfn_mmq_moe_gated_vec(int weight_type, const void* gate,
                                      const void* up, const float* x,
                                      const int32_t* ids, float* out, int m,

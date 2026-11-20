@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <utility>
 
@@ -442,6 +445,52 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::erase(m->allocations_, c.source);
     (void)hipFree(c.source);
     m->bytes_ -= c.count * sizeof(float) + kTailMargin;
+  }
+  // Local experiment: GUFO_STRIX_Q4K_DENSE lists projections (ssm_in,
+  // ssm_out, attn_qkv) that get a Q4_K copy for small decode batches. The
+  // Q8_0 originals stay for prefill and wide batches.
+  if (const char* list = std::getenv("GUFO_STRIX_Q4K_DENSE");
+      list != nullptr && list[0] != '\0') {
+    std::size_t copies = 0;
+    std::size_t copy_bytes = 0;
+    bool failed = false;
+    const auto shadow = [&](DeviceTensor& t, const char* name) {
+      if (failed || std::strstr(list, name) == nullptr || t.empty() ||
+          t.type != core::GgmlType::kQ8_0 || t.cols % 256 != 0)
+        return;
+      const std::size_t size = std::size_t{t.rows} * (t.cols / 256) * 144;
+      void* q4k = nullptr;
+      if (hipMalloc(&q4k, size + kTailMargin) != hipSuccess) {
+        failed = true;
+        return;
+      }
+      m->allocations_.push_back(q4k);
+      m->bytes_ += size + kTailMargin;
+      QuantizeQ8_0ToQ4K(t.data, q4k, t.rows, t.cols, nullptr);
+      (void)hipMemsetAsync(static_cast<std::uint8_t*>(q4k) + size, 0,
+                           kTailMargin, nullptr);
+      t.q4k = q4k;
+      ++copies;
+      copy_bytes += size;
+    };
+    for (auto& l : m->layers_) {
+      shadow(l.ssm_in, "ssm_in");
+      shadow(l.ssm_out, "ssm_out");
+      shadow(l.attn_qkv, "attn_qkv");
+    }
+    void* ids = nullptr;
+    constexpr std::size_t kIdBytes = 64 * sizeof(std::int32_t);
+    if (failed || hipMalloc(&ids, kIdBytes) != hipSuccess ||
+        hipMemsetAsync(ids, 0, kIdBytes, nullptr) != hipSuccess ||
+        hipDeviceSynchronize() != hipSuccess) {
+      if (error_msg != nullptr)
+        *error_msg = "Q4_K dense copy failed";
+      return nullptr;
+    }
+    m->allocations_.push_back(ids);
+    m->q4k_ids_ = static_cast<std::int32_t*>(ids);
+    std::fprintf(stderr, "strix-q4k: %zu dense copies, %zu MiB (%s)\n", copies,
+                 copy_bytes >> 20, list);
   }
   return m;
 }

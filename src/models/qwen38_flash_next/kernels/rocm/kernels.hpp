@@ -625,6 +625,12 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,
                       std::uint32_t vocab, hipStream_t stream);
 
+/// Local experiment: requantizes `rows` Q8_0 rows of `cols` (a multiple of
+/// 256) weights to Q4_K with ggml's reference quantize_row_q4_K_ref
+/// arithmetic on the dequantized values.
+void QuantizeQ8_0ToQ4K(const void* q8, void* q4k, std::size_t rows,
+                       std::uint32_t cols, hipStream_t stream);
+
 }  // namespace gufo::models::qwen38_flash_next::rocm
 
 #endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_

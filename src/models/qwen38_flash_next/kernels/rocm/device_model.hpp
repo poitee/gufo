@@ -20,6 +20,9 @@ struct DeviceTensor {
   std::uint32_t cols{0};
   std::uint32_t rows{0};
   std::uint32_t experts{1};
+  /// Local experiment: a Q4_K copy of a Q8_0 projection that small decode
+  /// batches read in place of `data`; null when absent.
+  void* q4k{nullptr};
 
   [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
   [[nodiscard]] const float* f32() const noexcept {
@@ -103,6 +106,10 @@ public:
   [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
   const DeviceLayer& mtp() const noexcept { return mtp_; }
   [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
+  /// Zeroed expert ids that route a Q4_K dense copy as one expert.
+  [[nodiscard]] const std::int32_t* q4k_ids() const noexcept {
+    return q4k_ids_;
+  }
   /// Widest K among the BF16/F16 matrices (activation staging for hipBLAS).
   [[nodiscard]] std::size_t max_half_cols() const noexcept {
     return max_half_cols_;
@@ -127,6 +134,7 @@ private:
   bool has_mtp_{false};
   std::vector<void*> allocations_;
   std::size_t bytes_{0};
+  std::int32_t* q4k_ids_{nullptr};
   std::size_t max_half_cols_{1};
   std::size_t max_q8_cols_{32};
 };
