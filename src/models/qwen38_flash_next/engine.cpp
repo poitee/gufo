@@ -4,6 +4,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -64,6 +66,58 @@ std::uint64_t SessionSnapshotHostBytes(std::uint32_t token_count,
   return sizeof(SessionSnapshotHeader) + image_bytes +
          std::uint64_t{token_count} * sizeof(std::int32_t) +
          std::uint64_t{vocab_size} * sizeof(float);
+}
+
+struct StrixMtpGateConfig {
+  bool enabled{false};
+  float greedy_gate{kMtpGateProbability};
+  float samp_gate{kMtpSampledGateProbability};
+  float greedy_drop{kMtpBatchDropProbability};
+  float samp_drop{0.0F};
+  std::uint32_t max_c2{0};
+  std::uint32_t max_c3{0};
+};
+
+const StrixMtpGateConfig& StrixMtpGateConfigValues() {
+  static const StrixMtpGateConfig cfg = [] {
+    StrixMtpGateConfig c;
+    const auto flag = [](const char* name) {
+      const char* v = std::getenv(name);
+      return v != nullptr && v[0] != '\0' && v[0] != '0';
+    };
+    const auto flt = [](const char* name, float def) {
+      const char* v = std::getenv(name);
+      if (v == nullptr || v[0] == '\0')
+        return def;
+      char* end = nullptr;
+      const float parsed = std::strtof(v, &end);
+      return end != v && std::isfinite(parsed) ? parsed : def;
+    };
+    const auto u32 = [](const char* name, std::uint32_t def) {
+      const char* v = std::getenv(name);
+      if (v == nullptr || v[0] == '\0')
+        return def;
+      char* end = nullptr;
+      const unsigned long parsed = std::strtoul(v, &end, 10);
+      return end != v ? static_cast<std::uint32_t>(parsed) : def;
+    };
+    c.enabled = flag("GUFO_STRIX_MTP_GATE");
+    c.greedy_gate = flt("GUFO_STRIX_MTP_GREEDY_GATE", kMtpGateProbability);
+    c.samp_gate = flt("GUFO_STRIX_MTP_SAMP_GATE", kMtpSampledGateProbability);
+    c.greedy_drop = flt("GUFO_STRIX_MTP_GREEDY_DROP", kMtpBatchDropProbability);
+    c.samp_drop = flt("GUFO_STRIX_MTP_SAMP_DROP", 0.0F);
+    c.max_c2 = u32("GUFO_STRIX_MTP_MAX_C2", 0);
+    c.max_c3 = u32("GUFO_STRIX_MTP_MAX_C3", 0);
+    if (c.enabled) {
+      std::fprintf(stderr,
+                   "strix-mtp-gate: greedy=%.2f samp=%.2f greedy_drop=%.2f "
+                   "samp_drop=%.2f max_c2=%u max_c3=%u\n",
+                   c.greedy_gate, c.samp_gate, c.greedy_drop, c.samp_drop,
+                   c.max_c2, c.max_c3);
+    }
+    return c;
+  }();
+  return cfg;
 }
 
 }  // namespace
@@ -657,6 +711,7 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
   if (!exec.MtpForward(
           *session_, replay, hidden_row,
           {.token = propose && candidates == nullptr ? &draft_token_ : nullptr,
+           .confidence = &draft_confidence_,
            .candidates = candidates,
            .kv_only = !propose,
            .draft_subset = draft_subset},
@@ -878,6 +933,9 @@ struct Session::PendingDecode {
   bool gpu_greedy{false};
   bool gpu_verification{false};
   std::size_t width{0};
+  /// The chain stops after a proposal below its gate (GateStops).
+  bool gated{false};
+  float draft_confidence{1.0F};
   std::optional<sampling::SamplerState> draft_sampler;
   std::uint64_t draft_rng{0};
   MtpCandidateLogits candidates;
@@ -893,6 +951,15 @@ struct Session::PendingDecode {
   std::size_t lookup_cap{0};
   std::uint32_t policy_concurrency{0};
 };
+
+bool Session::GateStops(const PendingDecode& pending) {
+  if (!pending.gated)
+    return false;
+  const auto& cfg = StrixMtpGateConfigValues();
+  return pending.sampled
+             ? pending.proposals.back().probability < cfg.samp_gate
+             : pending.draft_confidence < cfg.greedy_gate;
+}
 
 void Session::AppendDraft(PendingDecode& pending) {
   if (pending.sampled) {
@@ -985,14 +1052,28 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->policy_concurrency = MtpPolicyConcurrency(
       sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
       batch_drafts.has_value(), occupancy);
-  const std::size_t width =
-      MtpEnabled() && cap > 1
-          ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
-                              : draft_length_.Choose(
-                                    static_cast<std::uint32_t>(cap - 1),
-                                    static_cast<std::uint32_t>(tokens_.size()),
-                                    pending->policy_concurrency))
-          : cap;
+  const auto& gate_cfg = StrixMtpGateConfigValues();
+  std::size_t width = cap;
+  if (MtpEnabled() && cap > 1) {
+    std::uint32_t drafts =
+        batch_drafts
+            ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
+            : draft_length_.Choose(static_cast<std::uint32_t>(cap - 1),
+                                   static_cast<std::uint32_t>(tokens_.size()),
+                                   pending->policy_concurrency);
+    if (gate_cfg.enabled && !batch_drafts && drafts != 0) {
+      drafts = std::min<std::uint32_t>(static_cast<std::uint32_t>(cap - 1),
+                                       model_->options_.max_draft_tokens);
+      if (sampler.config().uses_random_sampling()) {
+        if (occupancy == 2 && gate_cfg.max_c2 > 0)
+          drafts = std::min(drafts, gate_cfg.max_c2);
+        else if (occupancy >= 3 && gate_cfg.max_c3 > 0)
+          drafts = std::min(drafts, gate_cfg.max_c3);
+      }
+    }
+    width = 1 + drafts;
+  }
+  pending->gated = gate_cfg.enabled;
   if (width == 0) {
     result->stop = true;
     return true;
@@ -1063,7 +1144,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->sampled_subset_cost =
       sampled && gpu_verification && pending->draft_subset &&
       std::min(max_tokens, room) > 2 * exec.max_speculative();
-  if (pending->sampled_subset_cost && !batch_drafts) {
+  if (!gate_cfg.enabled && pending->sampled_subset_cost && !batch_drafts) {
     // Price the head actually used, after vocabulary fallback and the copy
     // bypass. The policy depends only on committed history, not timings.
     pending->width =
@@ -1076,6 +1157,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     return false;
   }
   pending->draft = draft_token_;
+  pending->draft_confidence = draft_confidence_;
   if (!defer_head) {
     while (pending->chain.size() < pending->width) {
       AppendDraft(*pending);
@@ -1086,10 +1168,21 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       if (AppendLookup(*pending, stop_at_eos)) {
         break;
       }
+      if (GateStops(*pending)) {
+        if (pending->sampled && gate_cfg.samp_drop > 0.0F &&
+            pending->chain.size() > 2 &&
+            pending->proposals.back().probability < gate_cfg.samp_drop) {
+          pending->chain.pop_back();
+          pending->proposals.pop_back();
+        }
+        pending->width = pending->chain.size();
+        break;
+      }
       if (pending->chain.size() < pending->width &&
           !exec.MtpForward(
               *session_, std::span<const std::int32_t>(&pending->draft, 1), -1,
               {.token = sampled ? nullptr : &pending->draft,
+               .confidence = &pending->draft_confidence,
                .candidates = sampled ? &pending->candidates : nullptr,
                .draft_subset = pending->draft_subset},
               error_msg)) {
@@ -1503,10 +1596,12 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       auto& p = pending[i];
       if (!requests[i].session->session_->Cancelled() && p.speculative &&
           p.chain.size() < p.width) {
-        heads.push_back({requests[i].session->session_.get(),
-                         {.token = p.sampled ? nullptr : &p.draft,
-                          .candidates = p.sampled ? &p.candidates : nullptr,
-                          .draft_subset = p.draft_subset}});
+        heads.push_back(
+            {requests[i].session->session_.get(),
+             {.token = p.sampled ? nullptr : &p.draft,
+              .confidence = p.sampled ? nullptr : &p.draft_confidence,
+              .candidates = p.sampled ? &p.candidates : nullptr,
+              .draft_subset = p.draft_subset}});
       }
     }
     if (heads.empty())
@@ -1527,6 +1622,23 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       }
       if (session.AppendLookup(p, requests[i].stop_at_eos))
         continue;
+      if (GateStops(p)) {
+        const auto& cfg = StrixMtpGateConfigValues();
+        const bool drop_greedy =
+            batch_drafts && !p.sampled && p.draft_confidence < cfg.greedy_drop;
+        const bool drop_sampled =
+            p.sampled && cfg.samp_drop > 0.0F &&
+            p.proposals.back().probability < cfg.samp_drop &&
+            (requests.size() >= 2 ? p.chain.size() >= 2 : p.chain.size() > 2);
+        if (drop_greedy || drop_sampled) {
+          p.chain.pop_back();
+          if (p.sampled)
+            p.proposals.pop_back();
+          p.speculative = p.chain.size() > 1;
+        }
+        p.width = p.chain.size();
+        continue;
+      }
       if (p.chain.size() < p.width)
         bodies.push_back({requests[i].session->session_.get(),
                           std::span<const std::int32_t>(&p.draft, 1), -1});

@@ -1,5 +1,8 @@
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 #include "qfn_mmq.h"
@@ -14,6 +17,14 @@ namespace {
 
 constexpr std::uint32_t kBatchSessions = 8;
 constexpr std::uint32_t kDecodeRows = 8;
+
+bool WideBatchEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_WIDE_BATCH");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
 
 bool Fail(std::string* error, const std::string& message) {
   if (error != nullptr) {
@@ -490,8 +501,11 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
           !Check(hipStreamSynchronize(stream_), error)) {
         return false;
       }
-      if (item.output.token != nullptr)
-        *item.output.token = *mtp_token_host_;
+      if (item.output.token != nullptr) {
+        *item.output.token = mtp_token_host_[0];
+        if (item.output.confidence != nullptr)
+          *item.output.confidence = std::bit_cast<float>(mtp_token_host_[1]);
+      }
       if (item.output.candidates != nullptr)
         *item.output.candidates = *mtp_candidates_host_;
     }
@@ -605,12 +619,14 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
           slot[i] < subset_rows ? items[i].session->mtp_.draft_ids : nullptr;
       const auto count = std::min<std::size_t>(rows, kMtpCandidates);
       if (items[i].output.candidates == nullptr) {
+        // The token and its confidence (float bits) land in ids[0..1].
         Argmax(logits_of(i), s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
+        ArgmaxConfidence(logits_of(i), s_.mtp_token, rows, stream_);
         if (table != nullptr)
           RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1,
                         static_cast<std::uint32_t>(prefix), table, stream_);
         if (!Check(hipMemcpyAsync(batch_candidates_host_[i].ids.data(),
-                                  s_.mtp_token, sizeof(std::int32_t),
+                                  s_.mtp_token, 2 * sizeof(std::int32_t),
                                   hipMemcpyDeviceToHost, stream_),
                    error))
           return false;
@@ -647,8 +663,12 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (items[i].session->Cancelled())
       continue;
-    if (items[i].output.token != nullptr)
+    if (items[i].output.token != nullptr) {
       *items[i].output.token = batch_candidates_host_[i].ids[0];
+      if (items[i].output.confidence != nullptr)
+        std::memcpy(items[i].output.confidence,
+                    batch_candidates_host_[i].ids.data() + 1, sizeof(float));
+    }
     if (items[i].output.candidates != nullptr)
       *items[i].output.candidates = batch_candidates_host_[i];
   }
@@ -687,6 +707,18 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   }
   if (!QuantizeBatch(x, rows, w.cols, error))
     return false;
+  if (w.q4k != nullptr && rows <= 64) {
+    for (std::uint32_t r = 0; r < rows; r += 32) {
+      const auto* input = static_cast<const std::uint8_t*>(s_.x_q8t) +
+                          qfn_mmq_q8_1_bytes(r, w.cols);
+      if (qfn_mmq_q4_K_dense_vec_preq(
+              w.q4k, nullptr, input,
+              out + static_cast<std::size_t>(r) * w.rows, w.rows,
+              std::min(32U, rows - r), w.cols, stream_) != 0)
+        return Fail(error, "batched Q4_K projection failed");
+    }
+    return true;
+  }
   const auto project = [&](std::uint32_t first, std::uint32_t count) {
     const auto* input = static_cast<const std::uint8_t*>(s_.x_q8t) +
                         qfn_mmq_q8_1_bytes(first, w.cols);
@@ -696,18 +728,24 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                w.cols, stream_) == 0 ||
            Fail(error, "batched Q8 projection failed");
   };
+  const bool wide = WideBatchEnabled();
   if (w.rows == 320 && w.cols == 10240) {
+    if (wide && rows <= 32)
+      return project(0, rows);
     const auto full = rows / kDecodeRows * kDecodeRows;
     return project(0, full) && (full == rows || project(full, rows - full));
   }
   // Three matrix tiles help 33–48 rows; four tiles cost more than two
-  // 32-row launches. Small outputs with long K sweeps stay at eight.
+  // 32-row launches. Small outputs with long K sweeps stay at eight unless
+  // wide batching is enabled.
+  const bool matrix_shape =
+      (w.cols == 2560 && w.rows >= 1024) || (w.cols == 320 && w.rows == 10240);
   const auto chunk =
-      ((w.cols == 2560 && w.rows >= 1024) || (w.cols == 320 && w.rows == 10240))
+      (wide || matrix_shape)
           ? (w.cols == 2560 && w.rows >= 8192 && rows > 32 && rows <= 48 ? 48U
                                                                          : 32U)
           : kDecodeRows;
-  if (chunk == 32 && rows >= 64) {
+  if (chunk == 32 && matrix_shape && rows >= 64) {
     const auto full = rows / 32 * 32;
     return project(0, full) && (full == rows || project(full, rows - full));
   }
@@ -725,11 +763,21 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
   const bool q8 = up.type == core::GgmlType::kQ8_0 &&
                   gate.type == core::GgmlType::kQ8_0 && up.rows == gate.rows &&
                   up.cols == gate.cols;
-  if (q8 && !QuantizeBatch(x, rows, up.cols, error))
+  const bool q4k = q8 && up.q4k != nullptr && gate.q4k != nullptr;
+  if ((q4k || q8) && !QuantizeBatch(x, rows, up.cols, error))
     return false;
-  for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
-    const auto n = std::min(kDecodeRows, rows - r);
-    if (q8) {
+  const std::uint32_t step =
+      (q4k || (WideBatchEnabled() && q8)) ? 32U : kDecodeRows;
+  for (std::uint32_t r = 0; r < rows; r += step) {
+    const auto n = std::min(step, rows - r);
+    if (q4k) {
+      const auto* input = static_cast<const std::uint8_t*>(base.x_q8t) +
+                          qfn_mmq_q8_1_bytes(r, up.cols);
+      if (qfn_mmq_q4_K_dense_vec_preq(up.q4k, gate.q4k, input,
+                                      out + std::size_t{r} * up.rows, up.rows,
+                                      n, up.cols, stream_) != 0)
+        return Fail(error, "batched gated Q4_K projection failed");
+    } else if (q8) {
       const auto* input = static_cast<const std::uint8_t*>(base.x_q8t) +
                           qfn_mmq_q8_1_bytes(r, up.cols);
       if (qfn_mmq_q8_0_dense_vec_preq(up.data, gate.data, input,
@@ -760,18 +808,39 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   RouterTopK(base.router, c.num_experts + 1, base.ids, base.weights, rows,
              c.num_experts, c.num_experts_used, stream_);
   if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
-                       error) ||
-      !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
+                       error))
     return false;
-  if (l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
-      l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
+  const bool routed_q4k = l.ffn_gate_exps.type == core::GgmlType::kQ4_K &&
+                          l.ffn_up_exps.type == core::GgmlType::kQ4_K;
+  const bool reuse_q8 =
+      WideBatchEnabled() && routed_q4k &&
+      l.shexp_up.type == core::GgmlType::kQ8_0 &&
+      l.shexp_gate.type == core::GgmlType::kQ8_0 &&
+      l.shexp_up.rows == l.shexp_gate.rows &&
+      l.shexp_up.cols == l.shexp_gate.cols &&
+      l.shexp_up.cols == c.hidden_size;
+  if (reuse_q8) {
+    // base.x_q8t holds quantized x from GatedDenseBatch until shexp_down
+    // overwrites it.
+    if (qfn_mmq_moe_gated_vec_preq(static_cast<int>(l.ffn_gate_exps.type),
+                                   l.ffn_gate_exps.data, l.ffn_up_exps.data,
+                                   base.x_q8t, base.ids, base.gate_e,
+                                   c.expert_ff, c.hidden_size, rows,
+                                   c.num_experts, c.num_experts_used,
+                                   stream_) != 0)
+      return Fail(error, "batched routed vector projection failed");
+  }
+  if (!DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
+    return false;
+  if (routed_q4k) {
     // Share expert weights across request boundaries while retaining the
     // scalar Q8 activation quantization and dot-product reduction.
-    if (qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),
-                              l.ffn_gate_exps.data, l.ffn_up_exps.data, x,
-                              base.ids, base.gate_e, c.expert_ff, c.hidden_size,
-                              rows, c.num_experts, c.num_experts_used,
-                              stream_) != 0 ||
+    if ((!reuse_q8 &&
+         qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),
+                               l.ffn_gate_exps.data, l.ffn_up_exps.data, x,
+                               base.ids, base.gate_e, c.expert_ff,
+                               c.hidden_size, rows, c.num_experts,
+                               c.num_experts_used, stream_) != 0) ||
         qfn_mmq_moe_vec(
             static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
             base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,

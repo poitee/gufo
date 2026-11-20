@@ -1192,7 +1192,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.mtp_eproj = s.qkvz;
     s.mtp_res = s.res;
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
-    s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
+    // The draft token and its confidence (float bits), one host transfer.
+    s.mtp_token = Alloc<std::int32_t>(a, 2, error_msg);
     const auto candidate_ids = std::max<std::size_t>(
         MtpCandidateWorkspaceSize(c.vocab_size),
         e->options_.max_speculative * kArgmaxParts *
@@ -1203,7 +1204,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Pack those scores behind the 64 returned IDs for one host transfer.
     s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
     if (!Check(e->host_allocations_.Allocate(&e->mtp_token_host_,
-                                             sizeof(std::int32_t)),
+                                             2 * sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
         !Check(e->host_allocations_.Allocate(&e->mtp_candidates_host_,
                                              sizeof(MtpCandidateLogits)),
@@ -1601,7 +1602,7 @@ bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
                                      static_cast<int>(w.rows),
                                      static_cast<int>(w.cols),
                                      static_cast<int>(q.n), 1, 1, stream_)
-              : qfn_mmq_q4_K_dense_vec_preq(w.q4k, q.data, out,
+              : qfn_mmq_q4_K_dense_vec_preq(w.q4k, nullptr, q.data, out,
                                             static_cast<int>(w.rows),
                                             static_cast<int>(q.n),
                                             static_cast<int>(w.cols), stream_);
@@ -1634,6 +1635,16 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
     Q8Input xq;
     if (!Quantize(x, n_tokens, up.cols, &xq, error_msg)) {
       return false;
+    }
+    if (up.q4k != nullptr && gate.q4k != nullptr) {
+      if (qfn_mmq_q4_K_dense_vec_preq(
+              up.q4k, gate.q4k, xq.data, out, static_cast<int>(up.rows),
+              static_cast<int>(n_tokens), static_cast<int>(up.cols),
+              stream_) != 0) {
+        AssignError(error_msg, "gated Q4_K GEMV failed");
+        return false;
+      }
+      return true;
     }
     if (qfn_mmq_q8_0_dense_vec_preq(up.data, gate.data, xq.data, out,
                                     static_cast<int>(up.rows),
@@ -2879,13 +2890,14 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   }
   if (token) {
     Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, rows, stream_);
+    ArgmaxConfidence(s_.logits, s_.mtp_token, rows, stream_);
     if (draft != nullptr)
       RemapDraftIds(reinterpret_cast<std::uint32_t*>(s_.mtp_token), 1, prefix,
                     draft->mtp_.draft_ids, stream_);
-    if (!Check(
-            hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
-                           hipMemcpyDeviceToHost, stream_),
-            "draft token download", error_msg)) {
+    if (!Check(hipMemcpyAsync(mtp_token_host_, s_.mtp_token,
+                              2 * sizeof(std::int32_t), hipMemcpyDeviceToHost,
+                              stream_),
+               "draft token download", error_msg)) {
       return false;
     }
   }
@@ -4337,7 +4349,9 @@ bool Executor::MtpForward(Session& session,
     return false;
   }
   if (output.token != nullptr) {
-    *output.token = *mtp_token_host_;
+    *output.token = mtp_token_host_[0];
+    if (output.confidence != nullptr)
+      *output.confidence = std::bit_cast<float>(mtp_token_host_[1]);
   }
   if (output.candidates != nullptr) {
     *output.candidates = *mtp_candidates_host_;

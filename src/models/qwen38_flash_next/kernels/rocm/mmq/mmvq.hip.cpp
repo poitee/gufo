@@ -39,8 +39,8 @@ __launch_bounds__(32 * token_waves, 1) static __global__
           weights, input + token * stride_col_y + kbx,
           row_offset + kbx, kqs);
       if constexpr (has_gate) {
-        gate_sum[j] += vec_dot_q8_0_q8_1(gate, input + j * stride_col_y + kbx,
-                                         row_offset + kbx, kqs);
+        gate_sum[j] += vec_dot_q8_0_q8_1(
+            gate, input + token * stride_col_y + kbx, row_offset + kbx, kqs);
       }
     }
   }
@@ -653,16 +653,18 @@ static void launch_q8(const void* weights, const void* gate, const block_q8_1* i
     }
 }
 
-template<int waves>
-static void launch_q8_batch(const void* weights, const block_q8_1* input,
-                            float* output, int k, int rows, int tokens,
-                            int input_stride, hipStream_t stream) {
+template<int waves, bool has_gate = false>
+static void launch_q8_batch(const void* weights, const void* gate,
+                            const block_q8_1* input, float* output, int k,
+                            int rows, int tokens, int input_stride,
+                            hipStream_t stream) {
   if (tokens % 8 != 0) {
-    mul_mat_vec_q8<8, false, waves, true><<<rows, 32 * waves, 0, stream>>>(
-        weights, nullptr, input, output, k, rows, input_stride, tokens);
+    mul_mat_vec_q8<8, has_gate, waves, true>
+        <<<rows, 32 * waves, 0, stream>>>(weights, gate, input, output, k, rows,
+                                          input_stride, tokens);
   } else {
-    mul_mat_vec_q8<8, false, waves><<<rows, 32 * waves, 0, stream>>>(
-        weights, nullptr, input, output, k, rows, input_stride, tokens);
+    mul_mat_vec_q8<8, has_gate, waves><<<rows, 32 * waves, 0, stream>>>(
+        weights, gate, input, output, k, rows, input_stride, tokens);
   }
 }
 
@@ -692,62 +694,156 @@ int prepare_q8_decode() {
              : -2;
 }
 
-// Local experiment: a Q4_K dense projection. As in mul_mat_vec_q8, one wave
-// holds a weight row and every input, so the weights are read once per pass.
-template<int ncols_dst>
-__launch_bounds__(32, 1) static __global__
+// Local experiment: a Q4_K dense projection using Q4MoeFragment so weight
+// fragments and scales are unpacked once per kbx step across all tokens in
+// the wave, supporting 1..32 rows and optional fused SwiGLU gate.
+template<int ncols_dst, bool has_gate = false, int token_waves = 1,
+         bool ragged = false>
+__launch_bounds__(32 * token_waves, 1) static __global__
     void mul_mat_vec_q4k_dense(const void* __restrict__ weights,
+                               const void* __restrict__ gate,
                                const block_q8_1* __restrict__ input,
                                float* __restrict__ output,
                                const uint32_t ncols_x, const uint32_t nrows_x,
-                               const uint32_t stride_col_y) {
+                               const uint32_t stride_col_y,
+                               const uint32_t valid_tokens = ncols_dst) {
   constexpr int qi = QI4_K;
   constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
   constexpr int blocks_per_iter = vdr * 32 / qi;
-  const int lane = threadIdx.x;
+  const int lane = token_waves > 1 ? threadIdx.x % 32 : threadIdx.x;
+  const int first_token = token_waves > 1 ? threadIdx.x / 32 * ncols_dst : 0;
   const int row = blockIdx.x;
   const int blocks_per_row = ncols_x / QK_K;
   const int row_offset = row * blocks_per_row;
   const int kqs = vdr * (lane % (qi / vdr));
   float sum[ncols_dst] = {};
+  float gate_sum[has_gate ? ncols_dst : 1] = {};
   for (int kbx = lane / (qi / vdr); kbx < blocks_per_row;
        kbx += blocks_per_iter) {
     const int kby = kbx * (QK_K / QK8_1);
+    const Q4MoeFragment w(weights, row_offset + kbx, kqs);
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
-      sum[j] += vec_dot_q4_K_q8_1(weights, input + j * stride_col_y + kby,
-                                  row_offset + kbx, kqs);
+      const int token =
+          ragged ? min(first_token + j, int(valid_tokens) - 1) : first_token + j;
+      sum[j] += w.Dot(input + token * stride_col_y + kby, kqs);
+    }
+    if constexpr (has_gate) {
+      const Q4MoeFragment wg(gate, row_offset + kbx, kqs);
+#pragma unroll
+      for (int j = 0; j < ncols_dst; ++j) {
+        const int token =
+            ragged ? min(first_token + j, int(valid_tokens) - 1) : first_token + j;
+        gate_sum[j] += wg.Dot(input + token * stride_col_y + kby, kqs);
+      }
     }
   }
 #pragma unroll
   for (int j = 0; j < ncols_dst; ++j) {
     sum[j] = warp_reduce_sum<32>(sum[j]);
-    if (lane == 0)
-      output[j * nrows_x + row] = sum[j];
+    if constexpr (has_gate)
+      gate_sum[j] = warp_reduce_sum<32>(gate_sum[j]);
+    if (lane == 0 && (token_waves == 1 || first_token + j < valid_tokens)) {
+      float value = sum[j];
+      if constexpr (has_gate)
+        value *= ggml_hip_op_silu_single(gate_sum[j]);
+      output[(first_token + j) * nrows_x + row] = value;
+    }
   }
 }
 
-void mul_mat_vec_q4k_dense_dispatch(const void* weights,
+template<int tokens>
+static void launch_q4k(const void* weights, const void* gate,
+                       const block_q8_1* input, float* output, int k, int rows,
+                       int input_stride, hipStream_t stream) {
+  if (gate) {
+    mul_mat_vec_q4k_dense<tokens, true><<<rows, 32, 0, stream>>>(
+        weights, gate, input, output, k, rows, input_stride);
+  } else {
+    mul_mat_vec_q4k_dense<tokens, false><<<rows, 32, 0, stream>>>(
+        weights, nullptr, input, output, k, rows, input_stride);
+  }
+}
+
+template<int waves, bool has_gate>
+static void launch_q4k_batch(const void* weights, const void* gate,
+                             const block_q8_1* input, float* output, int k,
+                             int rows, int tokens, int input_stride,
+                             hipStream_t stream) {
+  if (tokens % 8 != 0) {
+    mul_mat_vec_q4k_dense<8, has_gate, waves, true>
+        <<<rows, 32 * waves, 0, stream>>>(weights, gate, input, output, k, rows,
+                                          input_stride, tokens);
+  } else {
+    mul_mat_vec_q4k_dense<8, has_gate, waves, false>
+        <<<rows, 32 * waves, 0, stream>>>(weights, gate, input, output, k, rows,
+                                          input_stride, tokens);
+  }
+}
+
+void mul_mat_vec_q4k_dense_dispatch(const void* weights, const void* gate,
                                     const block_q8_1* input, float* output,
                                     int k, int rows, int tokens,
                                     int input_stride, hipStream_t stream) {
-  GGML_ASSERT(k % QK_K == 0 && rows > 0 && tokens >= 1 && tokens <= 8);
-#define QFN_Q4K_DENSE(n)                                                  \
-  case n:                                                                 \
-    mul_mat_vec_q4k_dense<n><<<rows, 32, 0, stream>>>(                    \
-        weights, input, output, k, rows, input_stride);                   \
-    break;
-  switch (tokens) {
-    QFN_Q4K_DENSE(1)
-    QFN_Q4K_DENSE(2)
-    QFN_Q4K_DENSE(3)
-    QFN_Q4K_DENSE(4)
-    QFN_Q4K_DENSE(5)
-    QFN_Q4K_DENSE(6)
-    QFN_Q4K_DENSE(7)
-    QFN_Q4K_DENSE(8)
+  GGML_ASSERT(k % QK_K == 0 && rows > 0 && tokens >= 1 && tokens <= 32);
+  if (tokens > 8) {
+    if (gate) {
+      if (tokens <= 16)
+        launch_q4k_batch<2, true>(weights, gate, input, output, k, rows, tokens,
+                                  input_stride, stream);
+      else if (tokens <= 24)
+        launch_q4k_batch<3, true>(weights, gate, input, output, k, rows, tokens,
+                                  input_stride, stream);
+      else
+        launch_q4k_batch<4, true>(weights, gate, input, output, k, rows, tokens,
+                                  input_stride, stream);
+    } else {
+      if (tokens <= 16)
+        launch_q4k_batch<2, false>(weights, nullptr, input, output, k, rows,
+                                   tokens, input_stride, stream);
+      else if (tokens <= 24)
+        launch_q4k_batch<3, false>(weights, nullptr, input, output, k, rows,
+                                   tokens, input_stride, stream);
+      else
+        launch_q4k_batch<4, false>(weights, nullptr, input, output, k, rows,
+                                   tokens, input_stride, stream);
+    }
+    return;
   }
-#undef QFN_Q4K_DENSE
+  switch (tokens) {
+    case 1:
+      launch_q4k<1>(weights, gate, input, output, k, rows, input_stride,
+                    stream);
+      break;
+    case 2:
+      launch_q4k<2>(weights, gate, input, output, k, rows, input_stride,
+                    stream);
+      break;
+    case 3:
+      launch_q4k<3>(weights, gate, input, output, k, rows, input_stride,
+                    stream);
+      break;
+    case 4:
+      launch_q4k<4>(weights, gate, input, output, k, rows, input_stride,
+                    stream);
+      break;
+    case 5:
+      launch_q4k<5>(weights, gate, input, output, k, rows, input_stride,
+                    stream);
+      break;
+    case 6:
+      launch_q4k<6>(weights, gate, input, output, k, rows, input_stride,
+                    stream);
+      break;
+    case 7:
+      launch_q4k<7>(weights, gate, input, output, k, rows, input_stride,
+                    stream);
+      break;
+    case 8:
+      launch_q4k<8>(weights, gate, input, output, k, rows, input_stride,
+                    stream);
+      break;
+  }
 }
 
 void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
@@ -779,18 +875,31 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
   }
   GGML_ASSERT(k % QK8_0 == 0 && rows > 0);
   if (tokens > 8) {
-    GGML_ASSERT(tokens <= 32 && !gate);
+    GGML_ASSERT(tokens <= 32);
     // Each wave retains the eight-row arithmetic. Adjacent waves work
     // on the same weight row, reusing cache lines across requests.
-    if (tokens <= 16) {
-      launch_q8_batch<2>(weights, input, output, k, rows, tokens, input_stride,
-                          stream);
-    } else if (tokens <= 24) {
-      launch_q8_batch<3>(weights, input, output, k, rows, tokens, input_stride,
-                          stream);
+    if (gate) {
+      if (tokens <= 16) {
+        launch_q8_batch<2, true>(weights, gate, input, output, k, rows, tokens,
+                                 input_stride, stream);
+      } else if (tokens <= 24) {
+        launch_q8_batch<3, true>(weights, gate, input, output, k, rows, tokens,
+                                 input_stride, stream);
+      } else {
+        launch_q8_batch<4, true>(weights, gate, input, output, k, rows, tokens,
+                                 input_stride, stream);
+      }
     } else {
-      launch_q8_batch<4>(weights, input, output, k, rows, tokens, input_stride,
-                          stream);
+      if (tokens <= 16) {
+        launch_q8_batch<2, false>(weights, nullptr, input, output, k, rows,
+                                  tokens, input_stride, stream);
+      } else if (tokens <= 24) {
+        launch_q8_batch<3, false>(weights, nullptr, input, output, k, rows,
+                                  tokens, input_stride, stream);
+      } else {
+        launch_q8_batch<4, false>(weights, nullptr, input, output, k, rows,
+                                  tokens, input_stride, stream);
+      }
     }
     return;
   }

@@ -508,18 +508,20 @@ extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
                                out_b, false);
 }
 
-extern "C" int qfn_mmq_q4_K_dense_vec_preq(const void* W, const void* X_q8,
-                                           float* out_f32, int M, int N, int K,
+extern "C" int qfn_mmq_q4_K_dense_vec_preq(const void* W, const void* W_gate,
+                                           const void* X_q8, float* out_f32,
+                                           int M, int N, int K,
                                            hipStream_t stream) {
-  if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || N > 8 || K <= 0 ||
+  if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || N > 32 || K <= 0 ||
       K % 256 != 0) {
     fprintf(stderr, "qfn_mmq_q4_K_dense_vec_preq: bad arguments M=%d N=%d K=%d\n",
             M, N, K);
     return -1;
   }
   const int input_stride = GGML_PAD(K, MATRIX_ROW_PADDING) / QK8_1;
-  mul_mat_vec_q4k_dense_dispatch(W, static_cast<const block_q8_1*>(X_q8),
-                                 out_f32, K, M, N, input_stride, stream);
+  mul_mat_vec_q4k_dense_dispatch(W, W_gate,
+                                 static_cast<const block_q8_1*>(X_q8), out_f32,
+                                 K, M, N, input_stride, stream);
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 
@@ -726,7 +728,7 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
   if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || K <= 0 || K % 32 != 0 ||
       (N > 32 && !wide_matrix && !grouped_matrix &&
        (M != 320 || K != 10240 || N % 8 != 0)) ||
-      (N > MMVQ_MAX_BATCH_SIZE && W_gate)) {
+      (N > 32 && W_gate)) {
     fprintf(stderr,
             "qfn_mmq_q8_0_dense_vec_preq: bad arguments M=%d N=%d K=%d\n", M, N,
             K);

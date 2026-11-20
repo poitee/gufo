@@ -349,9 +349,28 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
         static_cast<std::uint32_t>(id) >= output_.rows)
       return fail("draft special tokens must lie above the prefix");
   }
-  // The prefix is the head's own leading rows: no copy.
+  // The prefix is the head's own leading rows: no copy unless the local Q4_K
+  // draft head experiment is switched on.
   draft_output_ = output_;
   draft_output_.rows = prefix_rows;
+  if (const char* q4k_draft = std::getenv("GUFO_STRIX_Q4K_DRAFT");
+      q4k_draft != nullptr && q4k_draft[0] != '\0' && q4k_draft[0] != '0' &&
+      output_.type == core::GgmlType::kQ8_0 && output_.cols % 256 == 0) {
+    const std::size_t size = std::size_t{prefix_rows} * (output_.cols / 256) * 144;
+    void* q4k = nullptr;
+    if (hipMalloc(&q4k, size + kTailMargin) != hipSuccess)
+      return fail("device allocation failed for the Q4_K draft head");
+    allocations_.push_back(q4k);
+    bytes_ += size + kTailMargin;
+    QuantizeQ8_0ToQ4K(output_.data, q4k, prefix_rows, output_.cols, nullptr);
+    if (hipMemsetAsync(static_cast<std::uint8_t*>(q4k) + size, 0, kTailMargin,
+                       nullptr) != hipSuccess ||
+        hipDeviceSynchronize() != hipSuccess)
+      return fail("Q4_K draft head quantization failed");
+    draft_output_.q4k = q4k;
+    std::fprintf(stderr, "strix-q4k-draft: %u rows, %zu MiB\n", prefix_rows,
+                 size >> 20);
+  }
   draft_specials_ = std::move(specials);
   return true;
 }
@@ -477,6 +496,10 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       shadow(l.ssm_in, "ssm_in");
       shadow(l.ssm_out, "ssm_out");
       shadow(l.attn_qkv, "attn_qkv");
+      shadow(l.shexp_up, "shexp");
+      shadow(l.shexp_gate, "shexp");
+      shadow(l.hc_attn.down, "hc_down");
+      shadow(l.hc_ffn.down, "hc_down");
     }
     void* ids = nullptr;
     constexpr std::size_t kIdBytes = 64 * sizeof(std::int32_t);

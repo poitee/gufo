@@ -25,7 +25,7 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
                             const block_q8_1* input, float* output,
                             int k, int rows, int tokens, int input_stride,
                             hipStream_t stream);
-void mul_mat_vec_q4k_dense_dispatch(const void* weights,
+void mul_mat_vec_q4k_dense_dispatch(const void* weights, const void* gate,
                                     const block_q8_1* input, float* output,
                                     int k, int rows, int tokens,
                                     int input_stride, hipStream_t stream);
