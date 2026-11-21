@@ -924,19 +924,20 @@ static void launch_q8_matrix(const void* weights, const block_q8_1* input,
   if (fast) {
     const int blocks = k / QK8_0;
     const int chunk = split_scratch != nullptr ? blocks / 4 : blocks;
-    if (chunk <= 12)
+    if (chunk <= 12) {
       launch_q8_matrix_fast_nw<token_tiles, 2>(weights, input, output, k, rows,
                                                tokens, input_stride, stream,
                                                split_scratch);
-    else if (chunk <= 24)
+      return;
+    }
+    if (chunk <= 24) {
       launch_q8_matrix_fast_nw<token_tiles, 4>(weights, input, output, k, rows,
                                                tokens, input_stride, stream,
                                                split_scratch);
-    else
-      launch_q8_matrix_fast_nw<token_tiles, 8>(weights, input, output, k, rows,
-                                               tokens, input_stride, stream,
-                                               split_scratch);
-    return;
+      return;
+    }
+    // chunk > 24 (e.g. lm_head K=2560): fall through to 8-wave ref kernel
+    // which already achieves ~212 GB/s (99% of measured copy BW).
   }
   if (split_scratch != nullptr) {
     if (tokens == 16 * token_tiles)
@@ -1483,22 +1484,20 @@ void mul_mat_vec_q8_dispatch_mode(const void* weights, const void* gate,
     // Put the tile loop in the grid instead of launching once per tile.
     if (force_fast) {
       const int blocks = k / QK8_0;
-      if (blocks <= 12)
+      if (blocks <= 12) {
         mul_mat_q8_decode_batch_fast<2, false, true, 1, 2>
             <<<dim3((rows + 15) / 16, tokens / 32), 64, 0, stream>>>(
                 static_cast<const block_q8_0*>(weights), input, output, k, rows,
                 input_stride, 32);
-      else if (blocks <= 24)
+        return;
+      }
+      if (blocks <= 24) {
         mul_mat_q8_decode_batch_fast<2, false, true, 1, 4>
             <<<dim3((rows + 15) / 16, tokens / 32), 128, 0, stream>>>(
                 static_cast<const block_q8_0*>(weights), input, output, k, rows,
                 input_stride, 32);
-      else
-        mul_mat_q8_decode_batch_fast<2, false, true, 1, 8>
-            <<<dim3((rows + 15) / 16, tokens / 32), 256, 0, stream>>>(
-                static_cast<const block_q8_0*>(weights), input, output, k, rows,
-                input_stride, 32);
-      return;
+        return;
+      }
     }
     mul_mat_q8_decode_batch<2, false, true>
         <<<dim3((rows + 15) / 16, tokens / 32), 256, 0, stream>>>(
