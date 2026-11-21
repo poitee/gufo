@@ -25,6 +25,20 @@ static bool SplitKQ8Enabled() {
   }();
   return enabled;
 }
+static bool FastQ8WmmaEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_FAST_Q8_WMMA");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+static bool FastQ4kDenseEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_FAST_Q4K_DENSE");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
 static int prepare_decode_kernels();
 extern "C" int qfn_mmq_init(int device) {
     if (device < 0) {
@@ -566,8 +580,12 @@ extern "C" int qfn_mmq_q4_K_dense_vec_preq(const void* W, const void* W_gate,
   }
   float* split_scratch = nullptr;
   ggml_hip_pool_alloc<float> split_pool;
-  if (WideBatchWmma() && !W_gate && N >= 9 && N <= 48 && M <= 512 &&
-      K >= 8192 && (K / QK_K) % 4 == 0) {
+  const bool split_plain = WideBatchWmma() && !W_gate && N >= 9 && N <= 48 &&
+                           M <= 512 && K >= 8192 && (K / QK_K) % 4 == 0;
+  const bool split_gated = FastQ4kDenseEnabled() && WideBatchWmma() &&
+                           W_gate != nullptr && N >= 9 && N <= 48 &&
+                           M <= 640 && K >= 2048 && (K / QK_K) % 2 == 0;
+  if (split_plain || split_gated) {
     const int dev = ggml_hip_get_device();
     ggml_backend_hip_context* ctx = get_ctx_for_device(dev);
     if (!ctx)
@@ -1050,8 +1068,9 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
   }
   float* split_scratch = nullptr;
   ggml_hip_pool_alloc<float> split_pool;
+  const int split_k_min = FastQ8WmmaEnabled() ? 2048 : 8192;
   if (wide_wmma && SplitKQ8Enabled() && !W_gate && N >= 9 && N <= 48 &&
-      M <= 512 && K >= 8192 && (K / QK8_0) % 4 == 0) {
+      M <= 512 && K >= split_k_min && (K / QK8_0) % 4 == 0) {
     const int dev = ggml_hip_get_device();
     ggml_backend_hip_context* ctx = get_ctx_for_device(dev);
     if (!ctx)
@@ -1199,6 +1218,111 @@ extern "C" int qfn_mmq_moe_gu_bench(
   *ref_ms_out = 0.5f * (ref_t[kIter / 2 - 1] + ref_t[kIter / 2]);
   *fast_ms_out = 0.5f * (fast_t[kIter / 2 - 1] + fast_t[kIter / 2]);
   return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+extern "C" int qfn_mmq_dense_fast_bench(const char* name, int is_q4k,
+                                        const void* W, const void* W_gate,
+                                        int M, int N, int K, float* ref_ms_out,
+                                        float* fast_ms_out,
+                                        float* max_abs_err_out,
+                                        hipStream_t stream) {
+  (void)name;
+  if (!W || M <= 0 || N < 9 || N > 48 || K <= 0 || !ref_ms_out ||
+      !fast_ms_out || !max_abs_err_out)
+    return -1;
+  const int input_stride = GGML_PAD(K, MATRIX_ROW_PADDING) / QK8_1;
+  const size_t x_bytes = static_cast<size_t>(N) * K * sizeof(float);
+  const size_t q8_bytes = qfn_mmq_q8_1_bytes(N, K);
+  const size_t out_elems = static_cast<size_t>(N) * M;
+  const size_t out_bytes = out_elems * sizeof(float);
+  const size_t split_bytes = 4 * out_bytes;
+  std::vector<float> h_x(static_cast<size_t>(N) * K);
+  for (size_t i = 0; i < h_x.size(); ++i)
+    h_x[i] = static_cast<float>((int(i * 37 + 11) % 63) - 31) * 0.015625f;
+  float *d_x = nullptr, *d_ref = nullptr, *d_fast = nullptr, *d_split = nullptr;
+  void* d_q8 = nullptr;
+  hipEvent_t e0 = nullptr, e1 = nullptr;
+  const auto cleanup = [&]() {
+    if (e0) (void)hipEventDestroy(e0);
+    if (e1) (void)hipEventDestroy(e1);
+    if (d_x) (void)hipFree(d_x);
+    if (d_q8) (void)hipFree(d_q8);
+    if (d_ref) (void)hipFree(d_ref);
+    if (d_fast) (void)hipFree(d_fast);
+    if (d_split) (void)hipFree(d_split);
+  };
+  if (hipMalloc(&d_x, x_bytes) != hipSuccess ||
+      hipMalloc(&d_q8, q8_bytes) != hipSuccess ||
+      hipMalloc(&d_ref, out_bytes) != hipSuccess ||
+      hipMalloc(&d_fast, out_bytes) != hipSuccess ||
+      hipMalloc(&d_split, split_bytes) != hipSuccess ||
+      hipEventCreate(&e0) != hipSuccess || hipEventCreate(&e1) != hipSuccess) {
+    cleanup();
+    return -2;
+  }
+  if (hipMemcpyAsync(d_x, h_x.data(), x_bytes, hipMemcpyHostToDevice, stream) !=
+          hipSuccess ||
+      qfn_mmq_quantize_q8_1(d_x, d_q8, N, K, stream) != 0 ||
+      hipStreamSynchronize(stream) != hipSuccess) {
+    cleanup();
+    return -3;
+  }
+  const auto* q8 = static_cast<const block_q8_1*>(d_q8);
+  const bool ref_split =
+      is_q4k ? (!W_gate && M <= 512 && K >= 8192 && (K / QK_K) % 4 == 0)
+             : (!W_gate && M <= 512 && K >= 8192 && (K / QK8_0) % 4 == 0);
+  const bool fast_split =
+      is_q4k ? (W_gate ? (M <= 640 && K >= 2048 && (K / QK_K) % 2 == 0)
+                       : (M <= 512 && K >= 8192 && (K / QK_K) % 4 == 0))
+             : (!W_gate && M <= 512 && K >= 2048 && (K / QK8_0) % 4 == 0);
+  const auto run_one = [&](bool fast, float* dst) {
+    float* sc = (fast ? fast_split : ref_split) ? d_split : nullptr;
+    if (is_q4k)
+      mul_mat_vec_q4k_dense_dispatch_mode(W, W_gate, q8, dst, K, M, N,
+                                          input_stride, stream, sc, fast);
+    else
+      mul_mat_vec_q8_dispatch_mode(W, W_gate, q8, dst, K, M, N, input_stride,
+                                   stream, sc, fast);
+  };
+  constexpr int kWarm = 5;
+  constexpr int kIter = 20;
+  float ref_t[kIter]{}, fast_t[kIter]{};
+  for (int i = 0; i < kWarm; ++i) run_one(false, d_ref);
+  for (int i = 0; i < kIter; ++i) {
+    (void)hipEventRecord(e0, stream);
+    run_one(false, d_ref);
+    (void)hipEventRecord(e1, stream);
+    (void)hipEventSynchronize(e1);
+    (void)hipEventElapsedTime(&ref_t[i], e0, e1);
+  }
+  for (int i = 0; i < kWarm; ++i) run_one(true, d_fast);
+  for (int i = 0; i < kIter; ++i) {
+    (void)hipEventRecord(e0, stream);
+    run_one(true, d_fast);
+    (void)hipEventRecord(e1, stream);
+    (void)hipEventSynchronize(e1);
+    (void)hipEventElapsedTime(&fast_t[i], e0, e1);
+  }
+  std::vector<float> h_ref(out_elems), h_fast(out_elems);
+  if (hipMemcpy(h_ref.data(), d_ref, out_bytes, hipMemcpyDeviceToHost) !=
+          hipSuccess ||
+      hipMemcpy(h_fast.data(), d_fast, out_bytes, hipMemcpyDeviceToHost) !=
+          hipSuccess) {
+    cleanup();
+    return -4;
+  }
+  float max_err = 0.0f;
+  for (size_t i = 0; i < out_elems; ++i) {
+    const float e = std::fabs(h_ref[i] - h_fast[i]);
+    if (e > max_err) max_err = e;
+  }
+  std::sort(ref_t, ref_t + kIter);
+  std::sort(fast_t, fast_t + kIter);
+  *ref_ms_out = 0.5f * (ref_t[kIter / 2 - 1] + ref_t[kIter / 2]);
+  *fast_ms_out = 0.5f * (fast_t[kIter / 2 - 1] + fast_t[kIter / 2]);
+  *max_abs_err_out = max_err;
+  cleanup();
+  return hipGetLastError() == hipSuccess ? 0 : -5;
 }
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);

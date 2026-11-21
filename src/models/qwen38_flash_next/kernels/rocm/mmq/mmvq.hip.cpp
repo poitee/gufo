@@ -12,6 +12,22 @@ static bool WideBatchWmma() {
   return enabled;
 }
 
+static bool FastQ8WmmaEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_FAST_Q8_WMMA");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
+static bool FastQ4kDenseEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_FAST_Q4K_DENSE");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
 // Each wave handles up to eight dense inputs for one weight row on gfx1151.
 // `scatter` reduces the inputs' sums together and stores them from one lane
 // each (same bits as reducing each sum on every lane and storing from lane 0).
@@ -152,6 +168,112 @@ static __global__ void reduce_splitk4_f32(const float* __restrict__ partials,
   const float v = partials[idx] + partials[stride + idx] +
                   partials[2 * stride + idx] + partials[3 * stride + idx];
   output[idx] = isfinite(v) ? v : 0.0f;
+}
+
+__launch_bounds__(256) static __global__ void reduce_splitk2_gated_f32(
+    const float* __restrict__ partials, float* __restrict__ output, int count) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count)
+    return;
+  const std::size_t stride = static_cast<std::size_t>(count);
+  const float u = partials[idx] + partials[stride + idx];
+  const float g = partials[2 * stride + idx] + partials[3 * stride + idx];
+  output[idx] =
+      isfinite(u) && isfinite(g) ? u * ggml_hip_op_silu_single(g) : 0.0f;
+}
+
+// Fast packed-K16 Q8_0 WMMA decode batch: 2 full K=16 WMMAs per Q8_0 block,
+// single FP32 accumulator per tile, adaptive num_waves (2/4/8) to match K,
+// cutting LDS from 32 KiB to 3..9 KiB and VGPRs from ~181 to ~60..84.
+template<int token_tiles, bool ragged, bool grouped = false, int split_k = 1,
+         int num_waves = 8>
+__launch_bounds__(32 * num_waves) static __global__
+    void mul_mat_q8_decode_batch_fast(const block_q8_0* __restrict__ weights,
+                                      const block_q8_1* __restrict__ input,
+                                      float* __restrict__ output, int k,
+                                      int rows, int input_stride, int tokens) {
+  if constexpr (grouped) {
+    input += std::size_t{blockIdx.y} * token_tiles * 16 * input_stride;
+    output += std::size_t{blockIdx.y} * token_tiles * 16 * rows;
+  }
+  using Int4 = __attribute__((ext_vector_type(4))) int;
+  using Int8 = __attribute__((ext_vector_type(8))) int;
+  __shared__ float partial[16 * 16][num_waves + 1];
+  const int wave = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int sub = lane % 16;
+  const int half = lane / 16;
+  const int first_row = blockIdx.x * 16;
+  const int blocks = k / QK8_0;
+  const int chunk = split_k > 1 ? blocks / split_k : blocks;
+  const int kb_begin = split_k > 1 ? blockIdx.y * chunk : 0;
+  const int kb_end = split_k > 1 ? kb_begin + chunk : blocks;
+  float acc[token_tiles][8]{};
+  for (int kb = kb_begin + wave; kb < kb_end; kb += num_waves) {
+    const auto* w =
+        weights +
+        static_cast<std::size_t>(min(first_row + sub, rows - 1)) * blocks + kb;
+    const float scale = __half2float(w->d);
+    float scales[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      scales[i] = __shfl(scale, 2 * i + half, 32);
+    const Int4 c0 = {get_int_b2(w->qs, 0), get_int_b2(w->qs, 1),
+                     get_int_b2(w->qs, 2), get_int_b2(w->qs, 3)};
+    const Int4 c1 = {get_int_b2(w->qs, 4), get_int_b2(w->qs, 5),
+                     get_int_b2(w->qs, 6), get_int_b2(w->qs, 7)};
+#pragma unroll
+    for (int tile = 0; tile < token_tiles; ++tile) {
+      const int token = ragged && tile == token_tiles - 1
+                            ? min(tile * 16 + sub, tokens - 1)
+                            : tile * 16 + sub;
+      const auto* x = input + token * input_stride + kb;
+      const float x_scale = __low2float(x->ds);
+      const Int4 u0 = {get_int_b4(x->qs, 0), get_int_b4(x->qs, 1),
+                       get_int_b4(x->qs, 2), get_int_b4(x->qs, 3)};
+      const Int4 u1 = {get_int_b4(x->qs, 4), get_int_b4(x->qs, 5),
+                       get_int_b4(x->qs, 6), get_int_b4(x->qs, 7)};
+      Int8 dots{};
+      dots = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, c0, true, u0,
+                                                        dots, false);
+      dots = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, c1, true, u1,
+                                                        dots, false);
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        acc[tile][i] =
+            __fmaf_rn(x_scale, __fmul_rn(scales[i], float(dots[i])),
+                      acc[tile][i]);
+    }
+  }
+#pragma unroll
+  for (int tile = 0; tile < token_tiles; ++tile) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int out = sub * 16 + 2 * i + half;
+      partial[out][wave] = acc[tile][i];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int out_idx = threadIdx.x; out_idx < 256; out_idx += 32 * num_waves) {
+      float val = 0.0f;
+#pragma unroll
+      for (int w_i = 0; w_i < num_waves; ++w_i)
+        val += partial[out_idx][w_i];
+      const int row = first_row + out_idx % 16;
+      const int token = tile * 16 + out_idx / 16;
+      if (row < rows && (!ragged || token < tokens)) {
+        if constexpr (split_k > 1) {
+          output[(static_cast<std::size_t>(blockIdx.y) * tokens + token) *
+                     rows +
+                 row] = val;
+        } else {
+          output[static_cast<std::size_t>(token) * rows + row] =
+              isfinite(val) ? val : 0.0f;
+        }
+      }
+    }
+    __syncthreads();
+  }
 }
 
 // Integer matrix products reuse each Q8 weight across up to 48 inputs.
@@ -758,11 +880,64 @@ static void launch_q8_batch(const void* weights, const void* gate,
   }
 }
 
+template<int token_tiles, int num_waves>
+static void launch_q8_matrix_fast_nw(const void* weights,
+                                     const block_q8_1* input, float* output,
+                                     int k, int rows, int tokens,
+                                     int input_stride, hipStream_t stream,
+                                     float* split_scratch) {
+  constexpr int wgs = 32 * num_waves;
+  if (split_scratch != nullptr) {
+    if (tokens == 16 * token_tiles)
+      mul_mat_q8_decode_batch_fast<token_tiles, false, false, 4, num_waves>
+          <<<dim3((rows + 15) / 16, 4), wgs, 0, stream>>>(
+              static_cast<const block_q8_0*>(weights), input, split_scratch, k,
+              rows, input_stride, tokens);
+    else
+      mul_mat_q8_decode_batch_fast<token_tiles, true, false, 4, num_waves>
+          <<<dim3((rows + 15) / 16, 4), wgs, 0, stream>>>(
+              static_cast<const block_q8_0*>(weights), input, split_scratch, k,
+              rows, input_stride, tokens);
+    const int count = tokens * rows;
+    reduce_splitk4_f32<<<(count + 255) / 256, 256, 0, stream>>>(
+        split_scratch, output, count);
+    return;
+  }
+  if (tokens == 16 * token_tiles)
+    mul_mat_q8_decode_batch_fast<token_tiles, false, false, 1, num_waves>
+        <<<(rows + 15) / 16, wgs, 0, stream>>>(
+            static_cast<const block_q8_0*>(weights), input, output, k, rows,
+            input_stride, tokens);
+  else
+    mul_mat_q8_decode_batch_fast<token_tiles, true, false, 1, num_waves>
+        <<<(rows + 15) / 16, wgs, 0, stream>>>(
+            static_cast<const block_q8_0*>(weights), input, output, k, rows,
+            input_stride, tokens);
+}
+
 template<int token_tiles>
 static void launch_q8_matrix(const void* weights, const block_q8_1* input,
                              float* output, int k, int rows, int tokens,
                              int input_stride, hipStream_t stream,
-                             float* split_scratch = nullptr) {
+                             float* split_scratch = nullptr,
+                             bool fast = false) {
+  if (fast) {
+    const int blocks = k / QK8_0;
+    const int chunk = split_scratch != nullptr ? blocks / 4 : blocks;
+    if (chunk <= 12)
+      launch_q8_matrix_fast_nw<token_tiles, 2>(weights, input, output, k, rows,
+                                               tokens, input_stride, stream,
+                                               split_scratch);
+    else if (chunk <= 24)
+      launch_q8_matrix_fast_nw<token_tiles, 4>(weights, input, output, k, rows,
+                                               tokens, input_stride, stream,
+                                               split_scratch);
+    else
+      launch_q8_matrix_fast_nw<token_tiles, 8>(weights, input, output, k, rows,
+                                               tokens, input_stride, stream,
+                                               split_scratch);
+    return;
+  }
   if (split_scratch != nullptr) {
     if (tokens == 16 * token_tiles)
       mul_mat_q8_decode_batch<token_tiles, false, false, 4>
@@ -1009,12 +1184,175 @@ __launch_bounds__(256) static __global__ void mul_mat_q4k_decode_batch(
   }
 }
 
+// Zero-spill gated Q4_K WMMA decode batch: computes weights then gate
+// sequentially to reuse fragment/scale VGPRs (scratch=0) and shares a single
+// 9 KiB LDS buffer. Supports split_k=2 for small-M gated projections (shexp).
+template<int token_tiles, bool ragged, int split_k = 1>
+__launch_bounds__(256) static __global__ void mul_mat_q4k_decode_batch_gated_fast(
+    const block_q4_K* __restrict__ weights,
+    const block_q4_K* __restrict__ gate,
+    const block_q8_1* __restrict__ input, float* __restrict__ output, int k,
+    int rows, int input_stride, int tokens) {
+  using Int4 = __attribute__((ext_vector_type(4))) int;
+  using Int8 = __attribute__((ext_vector_type(8))) int;
+  __shared__ float partial[16 * 16][9];
+  const int wave = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int sub = lane % 16;
+  const int half = lane / 16;
+  const int first_row = blockIdx.x * 16;
+  const int superblocks = k / QK_K;
+  const int chunk = split_k > 1 ? superblocks / split_k : superblocks;
+  const int kb_begin = split_k > 1 ? blockIdx.y * chunk : 0;
+  const int kb_end = split_k > 1 ? kb_begin + chunk : superblocks;
+  const int pair = wave >> 1;
+  const int nib_shift = (wave & 1) * 4;
+  float acc[token_tiles][8]{};
+  float gate_acc[token_tiles][8]{};
+  const auto accum_pass = [&](const block_q4_K* mat, int kb_k,
+                              float dst_acc[token_tiles][8]) {
+    const auto* w =
+        mat + static_cast<std::size_t>(min(first_row + sub, rows - 1)) *
+                  superblocks +
+        kb_k;
+    uint16_t aux[2];
+    q4_K_scale_pair(w, pair, aux);
+    const uint8_t* sc_ptr = reinterpret_cast<const uint8_t*>(aux);
+    const float2 dm = __half22float2(w->dm);
+    const float d_sc = dm.x * float(sc_ptr[wave & 1]);
+    const float dm_m = dm.y * float(sc_ptr[2 + (wave & 1)]);
+    float d_sc_r[8], dm_m_r[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      d_sc_r[i] = __shfl(d_sc, 2 * i + half, 32);
+      dm_m_r[i] = __shfl(dm_m, 2 * i + half, 32);
+    }
+    const uint8_t* qs = w->qs + 32 * pair;
+    const Int4 c0 = {(get_int_b4(qs, 0) >> nib_shift) & 0x0F0F0F0F,
+                     (get_int_b4(qs, 1) >> nib_shift) & 0x0F0F0F0F,
+                     (get_int_b4(qs, 2) >> nib_shift) & 0x0F0F0F0F,
+                     (get_int_b4(qs, 3) >> nib_shift) & 0x0F0F0F0F};
+    const Int4 c1 = {(get_int_b4(qs, 4) >> nib_shift) & 0x0F0F0F0F,
+                     (get_int_b4(qs, 5) >> nib_shift) & 0x0F0F0F0F,
+                     (get_int_b4(qs, 6) >> nib_shift) & 0x0F0F0F0F,
+                     (get_int_b4(qs, 7) >> nib_shift) & 0x0F0F0F0F};
+#pragma unroll
+    for (int tile = 0; tile < token_tiles; ++tile) {
+      const int token = ragged && tile == token_tiles - 1
+                            ? min(tile * 16 + sub, tokens - 1)
+                            : tile * 16 + sub;
+      const auto* x = input + token * input_stride + kb_k * 8 + wave;
+      const float2 x_ds = __half22float2(x->ds);
+      const Int4 u0 = {get_int_b4(x->qs, 0), get_int_b4(x->qs, 1),
+                       get_int_b4(x->qs, 2), get_int_b4(x->qs, 3)};
+      const Int4 u1 = {get_int_b4(x->qs, 4), get_int_b4(x->qs, 5),
+                       get_int_b4(x->qs, 6), get_int_b4(x->qs, 7)};
+      Int8 dots{};
+      dots = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, c0, true, u0,
+                                                        dots, false);
+      dots = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, c1, true, u1,
+                                                        dots, false);
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        dst_acc[tile][i] =
+            __fmaf_rn(x_ds.x, d_sc_r[i] * float(dots[i]), dst_acc[tile][i]);
+        dst_acc[tile][i] = __fmaf_rn(-x_ds.y, dm_m_r[i], dst_acc[tile][i]);
+      }
+    }
+  };
+  for (int kb_k = kb_begin; kb_k < kb_end; ++kb_k) {
+    accum_pass(weights, kb_k, acc);
+    accum_pass(gate, kb_k, gate_acc);
+  }
+#pragma unroll
+  for (int tile = 0; tile < token_tiles; ++tile) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int out = sub * 16 + 2 * i + half;
+      partial[out][wave] = acc[tile][i];
+    }
+    __syncthreads();
+    const int out_idx = threadIdx.x;
+    float val = 0.0f;
+#pragma unroll
+    for (int w_i = 0; w_i < 8; ++w_i)
+      val += partial[out_idx][w_i];
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int out = sub * 16 + 2 * i + half;
+      partial[out][wave] = gate_acc[tile][i];
+    }
+    __syncthreads();
+    float gval = 0.0f;
+#pragma unroll
+    for (int w_i = 0; w_i < 8; ++w_i)
+      gval += partial[out_idx][w_i];
+    const int row = first_row + out_idx % 16;
+    const int token = tile * 16 + out_idx / 16;
+    if (row < rows && (!ragged || token < tokens)) {
+      if constexpr (split_k > 1) {
+        output[(static_cast<std::size_t>(blockIdx.y) * tokens + token) * rows +
+               row] = val;
+        output[(static_cast<std::size_t>(split_k + blockIdx.y) * tokens +
+                token) *
+                   rows +
+               row] = gval;
+      } else {
+        const float out_v = isfinite(val) && isfinite(gval)
+                                ? val * ggml_hip_op_silu_single(gval)
+                                : 0.0f;
+        output[static_cast<std::size_t>(token) * rows + row] = out_v;
+      }
+    }
+    __syncthreads();
+  }
+}
+
 template<int token_tiles, bool has_gate>
 static void launch_q4k_matrix(const void* weights, const void* gate,
                               const block_q8_1* input, float* output, int k,
                               int rows, int tokens, int input_stride,
                               hipStream_t stream,
-                              float* split_scratch = nullptr) {
+                              float* split_scratch = nullptr,
+                              bool fast_gated = false) {
+  if constexpr (has_gate) {
+    if (fast_gated) {
+      if (split_scratch != nullptr) {
+        if (tokens == 16 * token_tiles) {
+          mul_mat_q4k_decode_batch_gated_fast<token_tiles, false, 2>
+              <<<dim3((rows + 15) / 16, 2), 256, 0, stream>>>(
+                  static_cast<const block_q4_K*>(weights),
+                  static_cast<const block_q4_K*>(gate), input, split_scratch, k,
+                  rows, input_stride, tokens);
+        } else {
+          mul_mat_q4k_decode_batch_gated_fast<token_tiles, true, 2>
+              <<<dim3((rows + 15) / 16, 2), 256, 0, stream>>>(
+                  static_cast<const block_q4_K*>(weights),
+                  static_cast<const block_q4_K*>(gate), input, split_scratch, k,
+                  rows, input_stride, tokens);
+        }
+        const int count = tokens * rows;
+        reduce_splitk2_gated_f32<<<(count + 255) / 256, 256, 0, stream>>>(
+            split_scratch, output, count);
+        return;
+      }
+      if (tokens == 16 * token_tiles) {
+        mul_mat_q4k_decode_batch_gated_fast<token_tiles, false, 1>
+            <<<(rows + 15) / 16, 256, 0, stream>>>(
+                static_cast<const block_q4_K*>(weights),
+                static_cast<const block_q4_K*>(gate), input, output, k, rows,
+                input_stride, tokens);
+      } else {
+        mul_mat_q4k_decode_batch_gated_fast<token_tiles, true, 1>
+            <<<(rows + 15) / 16, 256, 0, stream>>>(
+                static_cast<const block_q4_K*>(weights),
+                static_cast<const block_q4_K*>(gate), input, output, k, rows,
+                input_stride, tokens);
+      }
+      return;
+    }
+  }
   if constexpr (!has_gate) {
     if (split_scratch != nullptr) {
       if (tokens == 16 * token_tiles) {
@@ -1049,23 +1387,27 @@ static void launch_q4k_matrix(const void* weights, const void* gate,
   }
 }
 
-void mul_mat_vec_q4k_dense_dispatch(const void* weights, const void* gate,
-                                    const block_q8_1* input, float* output,
-                                    int k, int rows, int tokens,
-                                    int input_stride, hipStream_t stream,
-                                    float* split_scratch) {
+void mul_mat_vec_q4k_dense_dispatch_mode(const void* weights, const void* gate,
+                                         const block_q8_1* input, float* output,
+                                         int k, int rows, int tokens,
+                                         int input_stride, hipStream_t stream,
+                                         float* split_scratch,
+                                         bool force_fast) {
   GGML_ASSERT(k % QK_K == 0 && rows > 0 && tokens >= 1 && tokens <= 48);
   if (tokens > 8) {
     if (gate) {
       if (tokens <= 16)
         launch_q4k_matrix<1, true>(weights, gate, input, output, k, rows,
-                                   tokens, input_stride, stream);
+                                   tokens, input_stride, stream, split_scratch,
+                                   force_fast);
       else if (tokens <= 32)
         launch_q4k_matrix<2, true>(weights, gate, input, output, k, rows,
-                                   tokens, input_stride, stream);
+                                   tokens, input_stride, stream, split_scratch,
+                                   force_fast);
       else
         launch_q4k_matrix<3, true>(weights, gate, input, output, k, rows,
-                                   tokens, input_stride, stream);
+                                   tokens, input_stride, stream, split_scratch,
+                                   force_fast);
     } else {
       if (tokens <= 16)
         launch_q4k_matrix<1, false>(weights, nullptr, input, output, k, rows,
@@ -1118,16 +1460,46 @@ void mul_mat_vec_q4k_dense_dispatch(const void* weights, const void* gate,
   }
 }
 
-void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
-                             const block_q8_1* input, float* output, int k,
-                             int rows, int tokens, int input_stride,
-                             hipStream_t stream, float* split_scratch) {
+void mul_mat_vec_q4k_dense_dispatch(const void* weights, const void* gate,
+                                    const block_q8_1* input, float* output,
+                                    int k, int rows, int tokens,
+                                    int input_stride, hipStream_t stream,
+                                    float* split_scratch) {
+  mul_mat_vec_q4k_dense_dispatch_mode(weights, gate, input, output, k, rows,
+                                      tokens, input_stride, stream,
+                                      split_scratch, FastQ4kDenseEnabled());
+}
+
+void mul_mat_vec_q8_dispatch_mode(const void* weights, const void* gate,
+                                  const block_q8_1* input, float* output, int k,
+                                  int rows, int tokens, int input_stride,
+                                  hipStream_t stream, float* split_scratch,
+                                  bool force_fast) {
   const bool matrix_shape =
       (k == 2560 && rows >= 1024) || (k == 320 && rows == 10240) ||
       (WideBatchWmma() && rows >= 256 && k % QK8_0 == 0);
   if (!gate && matrix_shape && tokens > 48 && tokens % 32 == 0) {
     // Independent 32-row tiles retain the cache-invariant arithmetic.
     // Put the tile loop in the grid instead of launching once per tile.
+    if (force_fast) {
+      const int blocks = k / QK8_0;
+      if (blocks <= 12)
+        mul_mat_q8_decode_batch_fast<2, false, true, 1, 2>
+            <<<dim3((rows + 15) / 16, tokens / 32), 64, 0, stream>>>(
+                static_cast<const block_q8_0*>(weights), input, output, k, rows,
+                input_stride, 32);
+      else if (blocks <= 24)
+        mul_mat_q8_decode_batch_fast<2, false, true, 1, 4>
+            <<<dim3((rows + 15) / 16, tokens / 32), 128, 0, stream>>>(
+                static_cast<const block_q8_0*>(weights), input, output, k, rows,
+                input_stride, 32);
+      else
+        mul_mat_q8_decode_batch_fast<2, false, true, 1, 8>
+            <<<dim3((rows + 15) / 16, tokens / 32), 256, 0, stream>>>(
+                static_cast<const block_q8_0*>(weights), input, output, k, rows,
+                input_stride, 32);
+      return;
+    }
     mul_mat_q8_decode_batch<2, false, true>
         <<<dim3((rows + 15) / 16, tokens / 32), 256, 0, stream>>>(
             static_cast<const block_q8_0*>(weights), input, output, k, rows,
@@ -1137,13 +1509,13 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
   if (!gate && matrix_shape && tokens >= 9 && tokens <= 48) {
     if (tokens <= 16)
       launch_q8_matrix<1>(weights, input, output, k, rows, tokens, input_stride,
-                           stream, split_scratch);
+                           stream, split_scratch, force_fast);
     else if (tokens <= 32)
       launch_q8_matrix<2>(weights, input, output, k, rows, tokens, input_stride,
-                           stream, split_scratch);
+                           stream, split_scratch, force_fast);
     else
       launch_q8_matrix<3>(weights, input, output, k, rows, tokens, input_stride,
-                           stream, split_scratch);
+                           stream, split_scratch, force_fast);
     return;
   }
   GGML_ASSERT(k % QK8_0 == 0 && rows > 0);
@@ -1204,6 +1576,15 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
     default:
       GGML_ABORT("invalid vector batch width");
   }
+}
+
+void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
+                             const block_q8_1* input, float* output, int k,
+                             int rows, int tokens, int input_stride,
+                             hipStream_t stream, float* split_scratch) {
+  mul_mat_vec_q8_dispatch_mode(weights, gate, input, output, k, rows, tokens,
+                               input_stride, stream, split_scratch,
+                               FastQ8WmmaEnabled());
 }
 
 template<ggml_type type, int rows_per_wave = 2>

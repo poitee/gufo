@@ -128,4 +128,9 @@ int qfn_mmq_mxfp4_moe_raw(
     int M, int K, int n_tokens, int n_experts, int n_expert_used,
     hipStream_t stream);
 
+int qfn_mmq_dense_fast_bench(const char* name, int is_q4k, const void* W,
+                             const void* W_gate, int M, int N, int K,
+                             float* ref_ms_out, float* fast_ms_out,
+                             float* max_abs_err_out, hipStream_t stream);
+
 }

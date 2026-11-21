@@ -1278,6 +1278,42 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
           if (d_out) (void)hipFree(d_out);
         }
       }
+      // Dense fast-WMMA & zero-spill Q4K gated microbenchmarks on real Layer 0
+      // + output weights at N=13 (typical C=2 decode row count).
+      const auto& l0 = m->layers_[0];
+      const auto run_dense_bench = [&](const char* label, int is_q4k,
+                                       const void* W, const void* W_gate,
+                                       std::uint32_t M, std::uint32_t K,
+                                       int N) {
+        if (!W) return;
+        float ref_ms = 0.0f, fast_ms = 0.0f, max_err = 0.0f;
+        if (qfn_mmq_dense_fast_bench(label, is_q4k, W, W_gate,
+                                     static_cast<int>(M), N,
+                                     static_cast<int>(K), &ref_ms, &fast_ms,
+                                     &max_err, nullptr) == 0) {
+          const double spd = fast_ms > 0.0f ? ref_ms / fast_ms : 0.0;
+          std::fprintf(
+              stderr,
+              "strix-hw-bench: dense_%s M=%u K=%u N=%d ref_ms=%.4f "
+              "fast_ms=%.4f speedup=%.3fx max_err=%.2e\n",
+              label, M, K, N, ref_ms, fast_ms, spd, max_err);
+        }
+      };
+      if (l0.hc_attn.up.type == core::GgmlType::kQ8_0)
+        run_dense_bench("hc_up", 0, l0.hc_attn.up.data, nullptr,
+                        l0.hc_attn.up.rows, l0.hc_attn.up.cols, 13);
+      if (l0.router.type == core::GgmlType::kQ8_0)
+        run_dense_bench("router", 0, l0.router.data, nullptr, l0.router.rows,
+                        l0.router.cols, 13);
+      if (l0.shexp_down.type == core::GgmlType::kQ8_0)
+        run_dense_bench("shexp_dn", 0, l0.shexp_down.data, nullptr,
+                        l0.shexp_down.rows, l0.shexp_down.cols, 13);
+      if (l0.shexp_up.q4k != nullptr && l0.shexp_gate.q4k != nullptr)
+        run_dense_bench("shexp_gu_q4k", 1, l0.shexp_up.q4k, l0.shexp_gate.q4k,
+                        l0.shexp_up.rows, l0.shexp_up.cols, 13);
+      if (m->output_.type == core::GgmlType::kQ8_0)
+        run_dense_bench("lm_head", 0, m->output_.data, nullptr, m->output_.rows,
+                        m->output_.cols, 13);
     }
   }
   return m;
