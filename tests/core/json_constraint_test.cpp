@@ -2244,6 +2244,116 @@ void TestLlamaCppToolGrammarGoldens() {
   assert(rows == 688 && differences < rows / 5);
 }
 
+void TestProseAndStringFastPathsAndLru() {
+  using Format = JsonConstraint::ToolFormat;
+  const auto param_schema = parse(R"({
+    "type":"object",
+    "properties":{
+      "text":{"type":"string","maxLength":64},
+      "i":{"type":"string"}
+    },
+    "required":["i"],
+    "additionalProperties":false})");
+  for (const auto format : {Format::kQwen, Format::kDeepSeek}) {
+    const std::string opener =
+        format == Format::kQwen ? "<tool_call>" : "<｜DSML｜tool_calls>";
+    const std::string call =
+        format == Format::kQwen
+            ? "<tool_call>\n<function=f>\n<parameter=i>\nok\n</parameter>\n"
+              "</function>\n</tool_call>"
+            : "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n"
+              "<｜DSML｜parameter name=\"i\" string=\"true\">ok"
+              "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    const auto grammar = JsonConstraint::WithTools(
+        nullptr, {{"f", JsonConstraint::ToolParameters(param_schema, false, format)}},
+        false, true, format);
+    assert(Accepts(*grammar, "Note: file ends with fake `" + opener + "` tag."));
+    assert(Accepts(*grammar, "Example ``" + opener + "\n" + call + "`` done."));
+    assert(Accepts(*grammar, "Block:\n```xml\n" + call + "\n```\nStill prose."));
+    assert(Accepts(*grammar, "First fake `" + opener + "` then:\n" + call));
+    assert(!Accepts(*grammar, call + " trailing text"));
+  }
+
+  // Verify fast paths (ProseLexeme, PlainRawString, PlainJsonString) match
+  // scalar Allows() across all 256 raw bytes, multi-byte UTF-8, quotes, '<',
+  // backslashes, control chars, empty, and stop pieces.
+  std::vector<ConstraintVocabulary::Piece> pieces;
+  for (unsigned b = 0; b < 256; ++b)
+    pieces.push_back({std::string(1, static_cast<char>(b)), false});
+  for (const std::string s :
+       {"", "hello", "caf\xc3", "café 🍵", "\xc3\xa9", "\x80", "\"abc", "a\\n",
+        "a<b", "\n</parameter>\n", "</parameter>", "<tool_call>", "\n"})
+    pieces.push_back({s, false});
+  pieces.push_back({"", true});
+  const auto vocab = std::make_shared<ConstraintVocabulary>(
+      pieces.size(), [&](std::uint32_t i) { return pieces[i]; });
+  const auto check_all = [&](const JsonConstraint& g, std::string_view input) {
+    auto state = g.Start();
+    for (unsigned char b : input) {
+      const auto mask = vocab->Allowed(g, state);
+      for (std::uint32_t id = 0; id < pieces.size(); ++id)
+        assert(bool(mask[id]) == vocab->Allows(g, state, id));
+      state = g.Advance(state, b);
+      if (state.empty())
+        std::cerr << "check_all empty state at byte=" << int(b) << " in: "
+                  << input << "\n";
+      assert(!state.empty());
+    }
+    const auto mask = vocab->Allowed(g, state);
+    for (std::uint32_t id = 0; id < pieces.size(); ++id)
+      assert(bool(mask[id]) == vocab->Allows(g, state, id));
+  };
+  {
+    const auto qwen_grammar = JsonConstraint::WithTools(
+        nullptr, {{"f", JsonConstraint::ToolParameters(param_schema, false, Format::kQwen)}},
+        false, false, Format::kQwen);
+    check_all(*qwen_grammar,
+              "Note: fake `<tool_call>` ok.\n"
+              "<tool_call>\n<function=f>\n<parameter=i>\nRemove block\n"
+              "</parameter>\n<parameter=text>\ncafé 🍵 \"q\" \\ \x01\n"
+              "</parameter>\n</function>\n</tool_call>");
+  }
+  {
+    const auto json_grammar = JsonConstraint::Compile(param_schema, false);
+    check_all(*json_grammar, R"({"text":"ok","i":"hello \"world\" café \n\t"})");
+  }
+
+  // Verify 512-entry LRU + LookupCachedBitmask + initial_state_ retention.
+  const auto num_schema = parse(R"({
+    "type":"object",
+    "properties":{"x":{"type":"number","minimum":0}},
+    "required":["x"],"additionalProperties":false})");
+  TokenConstraint constraint;
+  constraint.grammar = JsonConstraint::Compile(num_schema, true);
+  constraint.vocabulary = vocab;
+  const auto initial = constraint.grammar->Start();
+  assert(constraint.LookupCachedBitmask(initial) == nullptr);
+  (void)constraint.Allowed(initial);
+  assert(constraint.LookupCachedBitmask(initial) != nullptr);
+  auto st = constraint.grammar->Start();
+  for (unsigned char b : std::string_view(R"({"x":1)"))
+    st = constraint.grammar->Advance(st, b);
+  (void)constraint.Allowed(st);
+  const auto hot = st;
+  JsonConstraint::State old_mid;
+  for (int i = 0; i < 400; ++i) {
+    st = constraint.grammar->Advance(st, '1');
+    (void)constraint.Allowed(st);
+    if (i == 0)
+      old_mid = st;
+  }
+  // Promoting hot alone leaves initial at the LRU tail to exercise its pin.
+  assert(constraint.LookupCachedBitmask(hot) != nullptr);
+  for (int i = 0; i < 200; ++i) {
+    st = constraint.grammar->Advance(st, '1');
+    (void)constraint.Allowed(st);
+  }
+  assert(constraint.LookupCachedBitmask(initial) != nullptr);
+  assert(constraint.LookupCachedBitmask(hot) != nullptr);
+  assert(constraint.LookupCachedBitmask(old_mid) == nullptr);
+  assert(constraint.LookupCachedBitmask(st) != nullptr);
+}
+
 int main(int argc, char** argv) {
   // Batch probes for the independent Python JSON Schema validator. This
   // exercises the production byte matcher without requiring model weights.
@@ -2300,6 +2410,7 @@ int main(int argc, char** argv) {
   TestToolSchemaSafety();
   TestNativeToolSchemaMatrix();
   TestLlamaCppToolGrammarGoldens();
+  TestProseAndStringFastPathsAndLru();
   std::cout << "JSON constraints: language, schema, Unicode and sampler checks "
                "passed\n";
 }

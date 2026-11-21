@@ -1488,6 +1488,13 @@ void mul_mat_vec_moe_down_grouped_dispatch(
   }
 }
 
+void group_moe_batch_split_launch(const int32_t* ids, int32_t* storage,
+                                  int tokens, int experts_used,
+                                  hipStream_t stream) {
+  group_moe_batch_split<<<(tokens * experts_used + 127) / 128, 128, 0, stream>>>(
+      ids, storage, tokens, experts_used);
+}
+
 void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                            const block_q8_1* input, const int32_t* ids,
                            int32_t* groups, float* output, int k, int rows,

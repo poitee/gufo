@@ -489,6 +489,23 @@ public:
   }
 
   bool CacheTransitions() const override { return true; }
+  bool PlainBody(std::string_view encoded,
+                 std::size_t token_bytes) const override {
+    if (!scalar_only_)
+      return false;
+    if (encoded.empty())
+      return maximum_ > token_bytes;
+    State state{};
+    if (encoded.size() != sizeof(state))
+      return false;
+    std::memcpy(state.data(), encoded.data(), sizeof(state));
+    return state[Mode] == Body && state[Count] < maximum_ &&
+           (maximum_ - state[Count]) > token_bytes;
+  }
+  bool PlainJsonString(std::string_view encoded,
+                       std::size_t token_bytes) const override {
+    return !encoded.empty() && PlainBody(encoded, token_bytes);
+  }
   void CanonicalMaskState(std::string& encoded,
                           std::size_t token_bytes) const override {
     if (encoded.empty())
@@ -760,6 +777,19 @@ public:
     }
   }
   bool CacheTransitions() const override { return true; }
+  bool PlainRawString(std::string_view encoded,
+                      std::size_t token_bytes) const override {
+    const auto lt = delimiter_.find('<');
+    if (lt == std::string::npos)
+      return false;
+    const std::size_t matched =
+        encoded.empty() ? 0 : static_cast<unsigned char>(encoded.front());
+    if (matched > lt)
+      return false;
+    const std::string_view inner =
+        encoded.empty() ? std::string_view{} : encoded.substr(1);
+    return string_->PlainBody(inner, token_bytes);
+  }
   void CanonicalMaskState(std::string& state,
                           std::size_t token_bytes) const override {
     if (state.empty())
@@ -824,6 +854,82 @@ private:
   std::vector<bool> can_close_;
 };
 
+struct MarkdownToolScan {
+  std::uint32_t explicit_prefix{}, tool_prefix{}, inline_quote{}, fence{};
+  std::uint32_t run{}, run_char{}, run_at_start{}, fence_char{};
+  std::uint32_t nonblank{}, closing_fence{};
+};
+
+std::vector<std::uint32_t> BuildPrefixFailure(std::string_view pattern) {
+  std::vector<std::uint32_t> failure(pattern.size());
+  for (std::size_t i = 1, matched = 0; i < pattern.size(); ++i) {
+    while (matched && pattern[i] != pattern[matched])
+      matched = failure[matched - 1];
+    if (pattern[i] == pattern[matched])
+      ++matched;
+    failure[i] = matched;
+  }
+  return failure;
+}
+
+template<typename Failure>
+std::uint32_t AdvancePrefix(std::uint32_t prefix, unsigned char byte,
+                            std::string_view marker, const Failure& failure) {
+  // Preserve overlapping marker prefixes without allocating per byte.
+  while (prefix && byte != static_cast<unsigned char>(marker[prefix]))
+    prefix = failure[prefix - 1];
+  if (byte == static_cast<unsigned char>(marker[prefix]))
+    return prefix + 1;
+  return std::uint32_t{0};
+}
+
+void AdvanceMarkdownQuoteState(MarkdownToolScan& state, unsigned char byte) {
+  const bool line_start = !state.nonblank;
+  if (byte != ' ' && byte != '\t' && byte != '\r' && byte != '\n')
+    state.nonblank = 1;
+  if (state.run && (byte != state.run_char)) {
+    if (state.fence) {
+      if (state.run_char == state.fence_char && state.run >= state.fence &&
+          state.run_at_start)
+        state.closing_fence = 1;
+    } else if (!state.inline_quote && state.run >= 3 && state.run_at_start) {
+      state.fence = state.run;
+      state.fence_char = state.run_char;
+    } else if (state.run_char == '`') {
+      if (!state.inline_quote)
+        state.inline_quote = state.run;
+      else if (state.run == state.inline_quote)
+        state.inline_quote = 0;
+    }
+    state.run = 0;
+    state.run_char = state.run_at_start = 0;
+  }
+  if (byte == '`' || byte == '~') {
+    if (!state.run) {
+      state.run_char = byte;
+      state.run_at_start = line_start;
+    }
+    if (state.run < UINT32_MAX)
+      ++state.run;
+  } else if (byte == '\n') {
+    if (state.fence && state.closing_fence)
+      state.fence = state.fence_char = 0;
+    if (state.inline_quote && !state.nonblank)
+      state.inline_quote = 0;
+    state.closing_fence = state.nonblank = 0;
+  } else if (byte != ' ' && byte != '\t' && byte != '\r') {
+    state.closing_fence = 0;
+  }
+}
+
+void EncodeMarkdownState(std::string& encoded, const MarkdownToolScan& state) {
+  const MarkdownToolScan empty{};
+  if (std::memcmp(&state, &empty, sizeof(state)) == 0)
+    encoded.clear();
+  else
+    encoded.assign(reinterpret_cast<const char*>(&state), sizeof(state));
+}
+
 // Native calls can start before </think>. Keep literal marker mentions and
 // Markdown code quoted; a complete native function header starts constrained
 // tool decoding. Only a small scan state belongs to each speculative branch.
@@ -832,18 +938,10 @@ public:
   ReasoningLexeme(std::string tool_prefix, ReasoningEnd end)
       : tool_prefix_(std::move(tool_prefix)),
         end_(end),
-        tool_failure_(tool_prefix_.size()) {
-    for (std::size_t i = 1, matched = 0; i < tool_prefix_.size(); ++i) {
-      while (matched && tool_prefix_[i] != tool_prefix_[matched])
-        matched = tool_failure_[matched - 1];
-      if (tool_prefix_[i] == tool_prefix_[matched])
-        ++matched;
-      tool_failure_[i] = matched;
-    }
-  }
+        tool_failure_(BuildPrefixFailure(tool_prefix_)) {}
   bool CacheTransitions() const override { return true; }
   bool PlainReasoning(std::string_view encoded) const override {
-    Scan state{};
+    MarkdownToolScan state{};
     if (!encoded.empty())
       std::memcpy(&state, encoded.data(), sizeof(state));
     return state.explicit_prefix == 0 && state.tool_prefix == 0;
@@ -859,82 +957,78 @@ public:
     return result;
   }
   Match Advance(std::string& encoded, unsigned char byte) const override {
-    Scan state{};
+    MarkdownToolScan state{};
     if (!encoded.empty())
       std::memcpy(&state, encoded.data(), sizeof(state));
-    const bool line_start = !state.nonblank;
-    if (byte != ' ' && byte != '\t' && byte != '\r' && byte != '\n')
-      state.nonblank = 1;
-    if (state.run && (byte != state.run_char)) {
-      if (state.fence) {
-        if (state.run_char == state.fence_char && state.run >= state.fence &&
-            state.run_at_start)
-          state.closing_fence = 1;
-      } else if (!state.inline_quote && state.run >= 3 && state.run_at_start) {
-        state.fence = state.run;
-        state.fence_char = state.run_char;
-      } else if (state.run_char == '`') {
-        if (!state.inline_quote)
-          state.inline_quote = state.run;
-        else if (state.run == state.inline_quote)
-          state.inline_quote = 0;
-      }
-      state.run = 0;
-      state.run_char = state.run_at_start = 0;
-    }
-    if (byte == '`' || byte == '~') {
-      if (!state.run) {
-        state.run_char = byte;
-        state.run_at_start = line_start;
-      }
-      if (state.run < UINT32_MAX)
-        ++state.run;
-    } else if (byte == '\n') {
-      if (state.fence && state.closing_fence)
-        state.fence = state.fence_char = 0;
-      if (state.inline_quote && !state.nonblank)
-        state.inline_quote = 0;
-      state.closing_fence = state.nonblank = 0;
-    } else if (byte != ' ' && byte != '\t' && byte != '\r') {
-      state.closing_fence = 0;
-    }
-    const auto advance = [&](std::uint32_t prefix, std::string_view marker,
-                             const auto& failure) {
-      // Preserve overlapping marker prefixes without allocating per byte.
-      while (prefix && byte != static_cast<unsigned char>(marker[prefix]))
-        prefix = failure[prefix - 1];
-      if (byte == static_cast<unsigned char>(marker[prefix]))
-        return prefix + 1;
-      return std::uint32_t{0};
-    };
+    AdvanceMarkdownQuoteState(state, byte);
     constexpr std::string_view explicit_end = "</think>";
     constexpr std::array<std::uint32_t, 8> explicit_failure{};
-    state.explicit_prefix =
-        advance(state.explicit_prefix, explicit_end, explicit_failure);
+    state.explicit_prefix = AdvancePrefix(state.explicit_prefix, byte,
+                                          explicit_end, explicit_failure);
     state.tool_prefix =
         state.inline_quote || state.fence
             ? 0
-            : advance(state.tool_prefix, tool_prefix_, tool_failure_);
+            : AdvancePrefix(state.tool_prefix, byte, tool_prefix_,
+                            tool_failure_);
     if (state.explicit_prefix == explicit_end.size())
       return {false, end_ == ReasoningEnd::kExplicit};
     if (state.tool_prefix == tool_prefix_.size())
       return {false, end_ == ReasoningEnd::kTool};
-    const Scan empty{};
-    if (std::memcmp(&state, &empty, sizeof(state)) == 0)
-      encoded.clear();
-    else
-      encoded.assign(reinterpret_cast<const char*>(&state), sizeof(state));
+    EncodeMarkdownState(encoded, state);
     return {true, end_ == ReasoningEnd::kUnfinished};
   }
 
 private:
-  struct Scan {
-    std::uint32_t explicit_prefix{}, tool_prefix{}, inline_quote{}, fence{};
-    std::uint32_t run{}, run_char{}, run_at_start{}, fence_char{};
-    std::uint32_t nonblank{}, closing_fence{};
-  };
   std::string tool_prefix_;
   ReasoningEnd end_;
+  std::vector<std::uint32_t> tool_failure_;
+};
+
+// Native prose outside <think> keeps literal marker mentions quoted inside
+// Markdown inline backticks or code fences; an unquoted opener begins calls.
+class ProseLexeme final : public JsonSchemaLexeme {
+public:
+  ProseLexeme(std::string tool_prefix, ProseEnd end)
+      : tool_prefix_(std::move(tool_prefix)),
+        end_(end),
+        tool_failure_(BuildPrefixFailure(tool_prefix_)) {}
+  bool CacheTransitions() const override { return true; }
+  bool PlainReasoning(std::string_view encoded) const override {
+    MarkdownToolScan state{};
+    if (!encoded.empty())
+      std::memcpy(&state, encoded.data(), sizeof(state));
+    return state.tool_prefix == 0 && !tool_prefix_.empty() &&
+           tool_prefix_.front() == '<';
+  }
+  Match Check(std::string_view bytes) const override {
+    std::string state;
+    Match result{true, end_ == ProseEnd::kUnfinished};
+    for (const unsigned char byte : bytes) {
+      result = Advance(state, byte);
+      if (!result.prefix)
+        break;
+    }
+    return result;
+  }
+  Match Advance(std::string& encoded, unsigned char byte) const override {
+    MarkdownToolScan state{};
+    if (!encoded.empty())
+      std::memcpy(&state, encoded.data(), sizeof(state));
+    AdvanceMarkdownQuoteState(state, byte);
+    state.tool_prefix =
+        state.inline_quote || state.fence
+            ? 0
+            : AdvancePrefix(state.tool_prefix, byte, tool_prefix_,
+                            tool_failure_);
+    if (state.tool_prefix == tool_prefix_.size())
+      return {false, end_ == ProseEnd::kTool};
+    EncodeMarkdownState(encoded, state);
+    return {true, end_ == ProseEnd::kUnfinished};
+  }
+
+private:
+  std::string tool_prefix_;
+  ProseEnd end_;
   std::vector<std::uint32_t> tool_failure_;
 };
 
@@ -955,6 +1049,10 @@ std::shared_ptr<const JsonSchemaLexeme> JsonSchemaLexeme::Whitespace() {
 std::shared_ptr<const JsonSchemaLexeme> JsonSchemaLexeme::Reasoning(
     std::string tool_prefix, ReasoningEnd end) {
   return std::make_shared<ReasoningLexeme>(std::move(tool_prefix), end);
+}
+std::shared_ptr<const JsonSchemaLexeme> JsonSchemaLexeme::Prose(
+    std::string tool_prefix, ProseEnd end) {
+  return std::make_shared<ProseLexeme>(std::move(tool_prefix), end);
 }
 
 json::Value JsonSchemaLexeme::IntersectMultipleOf(const json::Value& a,

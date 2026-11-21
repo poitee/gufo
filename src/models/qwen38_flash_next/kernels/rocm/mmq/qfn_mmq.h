@@ -50,6 +50,12 @@ int qfn_mmq_q4_K_wmma_selftest(const void* W_q4k, int M, int K,
 int qfn_mmq_moe_down_selftest(int weight_type, const void* W, int M, int K,
                               int n_experts, hipStream_t stream);
 
+int qfn_mmq_moe_gu_selftest_compare(const void* gate, const void* up,
+                                    const float* X_f32, const int32_t* ids,
+                                    float* out_ref, float* out_fast, int M,
+                                    int K, int n_tokens, int n_experts_used,
+                                    hipStream_t stream);
+
 // qfn_mmq_moe_vec over a caller-quantized Q8_1 input (local experiment).
 int qfn_mmq_moe_vec_preq(int weight_type, const void* W, const void* X_q8,
                          const int32_t* ids, float* out, int M, int K,

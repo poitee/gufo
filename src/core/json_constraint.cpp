@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cmath>
 #include <deque>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -29,6 +30,33 @@ constexpr std::size_t kMaxWork = 2000000;
 
 [[noreturn]] void Invalid(std::string_view message) {
   throw std::invalid_argument("JSON Schema: " + std::string(message));
+}
+
+bool IsValidUtf8Prefix(std::string_view text) {
+  std::size_t i = 0;
+  while (i < text.size()) {
+    const unsigned char byte = static_cast<unsigned char>(text[i++]);
+    if (byte < 0x80)
+      continue;
+    const unsigned width = byte >= 0xc2 && byte <= 0xdf   ? 2
+                           : byte >= 0xe0 && byte <= 0xef ? 3
+                           : byte >= 0xf0 && byte <= 0xf4 ? 4
+                                                          : 0;
+    if (!width)
+      return false;
+    unsigned low = byte == 0xe0 ? 0xa0 : byte == 0xf0 ? 0x90 : 0x80;
+    unsigned high = byte == 0xed ? 0x9f : byte == 0xf4 ? 0x8f : 0xbf;
+    for (unsigned rem = width - 1; rem > 0; --rem) {
+      if (i >= text.size())
+        return true;
+      const unsigned char cont = static_cast<unsigned char>(text[i++]);
+      if (cont < low || cont > high)
+        return false;
+      low = 0x80;
+      high = 0xbf;
+    }
+  }
+  return true;
 }
 
 // Some unsupported applicators admit fields outside "properties". Ignoring
@@ -2037,7 +2065,10 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
     }
     return base;
   };
-  const auto prose = plain_answer ? text(calls) : UINT32_MAX;
+  const auto prose =
+      plain_answer && (required || format == ToolFormat::kJson)
+          ? text(calls)
+          : UINT32_MAX;
   // As in llama.cpp's DeepSeek V4 and Qwen3-Coder parsers, calls end the
   // output: parallel calls share one DeepSeek block, Qwen calls may follow
   // each other, and no text may follow them. Text after a call is where
@@ -2154,9 +2185,25 @@ std::shared_ptr<const JsonConstraint> JsonConstraint::WithTools(
           {named, root, end, after});
     }
   }
-  if (plain_answer && !required)
-    alternatives.push_back({prose});
-  else if (format == ToolFormat::kJson)
+  if (plain_answer && !required) {
+    if (format != ToolFormat::kJson) {
+      check_capacity(0, 0, 2);
+      const auto add_prose = [&](JsonSchemaLexeme::ProseEnd prose_end) {
+        const auto id =
+            static_cast<std::uint32_t>(kLexeme | grammar->lexemes_.size());
+        grammar->lexemes_.push_back(
+            JsonSchemaLexeme::Prose(std::string(marker), prose_end));
+        return id;
+      };
+      alternatives.push_back({});
+      alternatives.push_back(
+          {add_prose(JsonSchemaLexeme::ProseEnd::kUnfinished)});
+      alternatives.push_back(
+          {add_prose(JsonSchemaLexeme::ProseEnd::kTool), calls});
+    } else {
+      alternatives.push_back({prose});
+    }
+  } else if (format == ToolFormat::kJson)
     alternatives.push_back({literal(marker), calls});
   else {
     std::bitset<256> whitespace;
@@ -2304,9 +2351,18 @@ ConstraintVocabulary::ConstraintVocabulary(std::uint32_t size,
   for (std::uint32_t token = 0; token < size; ++token) {
     pieces_.push_back(reader(token));
     const auto& piece = pieces_.back();
-    if (piece.stop || piece.text.empty() ||
-        piece.text.find('<') != std::string::npos)
+    const bool has_lt = piece.text.find('<') != std::string::npos;
+    const bool valid_utf8 =
+        !piece.stop && !piece.text.empty() && IsValidUtf8Prefix(piece.text);
+    if (piece.stop || piece.text.empty() || has_lt)
       reasoning_boundary_tokens_.push_back(token);
+    if (piece.stop || piece.text.empty() || has_lt || !valid_utf8)
+      raw_string_boundary_tokens_.push_back(token);
+    if (piece.stop || piece.text.empty() || !valid_utf8 ||
+        std::ranges::any_of(piece.text, [](unsigned char b) {
+          return b == '"' || b == '\\' || b < 0x20;
+        }))
+      json_string_boundary_tokens_.push_back(token);
     total_bytes += piece.text.size();
     if (total_bytes > 64 * 1024 * 1024)
       throw std::invalid_argument("constraint vocabulary exceeds 64 MiB");
@@ -2357,19 +2413,37 @@ ConstraintVocabulary::ConstraintVocabulary(std::uint32_t size,
 
 std::vector<std::uint8_t> ConstraintVocabulary::Allowed(
     const JsonConstraint& grammar, const JsonConstraint::State& state) const {
-  if (std::ranges::any_of(state, [&](const auto& stack) {
+  if (!(grammar.stop_only_when_complete_ && grammar.Complete(state))) {
+    const auto has_lexeme = [&](auto&& pred) {
+      return std::ranges::any_of(state, [&](const auto& stack) {
         return !stack.symbols.empty() && (stack.symbols.back() & kLexeme) &&
-               grammar.lexemes_.at(stack.symbols.back() & ~kLexeme)
-                   ->PlainReasoning(stack.lexeme);
-      })) {
-    // Neither native boundary can begin without '<'. Most vocabulary entries
-    // are therefore provably valid without walking their bytes. Boundary,
-    // empty and stop tokens still use the complete grammar, including tokens
-    // that contain both a boundary and constrained output.
-    std::vector<std::uint8_t> mask(pieces_.size(), 1);
-    for (const auto token : reasoning_boundary_tokens_)
-      mask[token] = Allows(grammar, state, token);
-    return mask;
+               pred(*grammar.lexemes_.at(stack.symbols.back() & ~kLexeme),
+                    stack.lexeme);
+      });
+    };
+    const auto boundary_mask = [&](const std::vector<std::uint32_t>& boundary) {
+      std::vector<std::uint8_t> mask(pieces_.size(), 1);
+      for (const auto token : boundary)
+        mask[token] = Allows(grammar, state, token);
+      return mask;
+    };
+    if (has_lexeme([](const auto& lex, std::string_view encoded) {
+          return lex.PlainReasoning(encoded);
+        })) {
+      // Neither native boundary can begin without '<'. Most vocabulary
+      // entries are therefore provably valid without walking their bytes.
+      return boundary_mask(reasoning_boundary_tokens_);
+    }
+    if (has_lexeme([&](const auto& lex, std::string_view encoded) {
+          return lex.PlainRawString(encoded, max_token_bytes_);
+        })) {
+      return boundary_mask(raw_string_boundary_tokens_);
+    }
+    if (has_lexeme([&](const auto& lex, std::string_view encoded) {
+          return lex.PlainJsonString(encoded, max_token_bytes_);
+        })) {
+      return boundary_mask(json_string_boundary_tokens_);
+    }
   }
   std::vector<std::uint8_t> mask(pieces_.size());
   if (grammar.Complete(state)) {
@@ -2499,8 +2573,10 @@ TokenConstraint::MaskEntry TokenConstraint::LookupOrBuild(
     if (initial_state_.empty())
       initial_state_ = grammar->CanonicalMaskState(
           grammar->Start(), vocabulary->max_token_bytes_);
-    if (const auto found = masks_.find(canonical); found != masks_.end())
-      return found->second;
+    if (const auto found = masks_.find(canonical); found != masks_.end()) {
+      lru_.splice(lru_.begin(), lru_, found->second.lru);
+      return found->second.entry;
+    }
   }
   auto bytes = std::make_shared<std::vector<std::uint8_t>>(
       vocabulary->Allowed(*grammar, canonical));
@@ -2514,18 +2590,26 @@ TokenConstraint::MaskEntry TokenConstraint::LookupOrBuild(
   }
   MaskEntry entry{std::move(bytes), std::move(bits)};
   const std::lock_guard lock(mutex_);
-  if (const auto found = masks_.find(canonical); found != masks_.end())
-    return found->second;
-  if (masks_.size() >= 128) {
-    // Every request needs the initial mask, even when the model state is
-    // cached. Keep it within the same 128-entry budget instead of rebuilding
-    // the entire vocabulary mask after each completed native call.
-    auto victim = masks_.begin();
-    if (victim->first == initial_state_)
-      ++victim;
-    masks_.erase(victim);
+  if (const auto found = masks_.find(canonical); found != masks_.end()) {
+    lru_.splice(lru_.begin(), lru_, found->second.lru);
+    return found->second.entry;
   }
-  return masks_.emplace(std::move(canonical), std::move(entry)).first->second;
+  if (masks_.size() >= 512) {
+    // Every request needs the initial mask, even when the model state is
+    // cached. Keep it within the 512-entry LRU budget instead of rebuilding
+    // the entire vocabulary mask after each completed native call.
+    auto victim = std::prev(lru_.end());
+    if (*victim == initial_state_ && victim != lru_.begin())
+      --victim;
+    masks_.erase(*victim);
+    lru_.erase(victim);
+  }
+  auto [slot, inserted] =
+      masks_.emplace(std::move(canonical), CacheSlot{std::move(entry), {}});
+  (void)inserted;
+  lru_.push_front(slot->first);
+  slot->second.lru = lru_.begin();
+  return slot->second.entry;
 }
 
 std::shared_ptr<const std::vector<std::uint8_t>> TokenConstraint::Allowed(
@@ -2536,5 +2620,17 @@ std::shared_ptr<const std::vector<std::uint8_t>> TokenConstraint::Allowed(
 std::shared_ptr<const TokenBitmask> TokenConstraint::AllowedBitmask(
     const JsonConstraint::State& state) const {
   return LookupOrBuild(state).bits;
+}
+
+std::shared_ptr<const TokenBitmask> TokenConstraint::LookupCachedBitmask(
+    const JsonConstraint::State& state) const {
+  auto canonical =
+      grammar->CanonicalMaskState(state, vocabulary->max_token_bytes_);
+  const std::lock_guard lock(mutex_);
+  const auto found = masks_.find(canonical);
+  if (found == masks_.end())
+    return nullptr;
+  lru_.splice(lru_.begin(), lru_, found->second.lru);
+  return found->second.entry.bits;
 }
 }  // namespace gufo::sampling

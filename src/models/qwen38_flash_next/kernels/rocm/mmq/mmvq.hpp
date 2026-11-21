@@ -70,3 +70,22 @@ void mul_mat_vec_moe_batch_wave64_split(const void* gate, const void* up,
                                        int k, int rows, int tokens,
                                        int experts_used, int input_stride,
                                        hipStream_t stream);
+
+void mul_mat_vec_moe_batch_wave64_split_ref(const void* gate, const void* up,
+                                           const block_q8_1* input,
+                                           const int32_t* storage,
+                                           float* output, int k, int rows,
+                                           int tokens, int experts_used,
+                                           int input_stride,
+                                           hipStream_t stream);
+
+void mul_mat_vec_moe_batch_wave32_split(const void* gate, const void* up,
+                                       const block_q8_1* input,
+                                       const int32_t* storage, float* output,
+                                       int k, int rows, int tokens,
+                                       int experts_used, int input_stride,
+                                       hipStream_t stream);
+
+void group_moe_batch_split_launch(const int32_t* ids, int32_t* storage,
+                                  int tokens, int experts_used,
+                                  hipStream_t stream);

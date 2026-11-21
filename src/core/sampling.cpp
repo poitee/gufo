@@ -533,6 +533,13 @@ std::shared_ptr<const TokenBitmask> SamplerState::ConstraintBitmask() const {
   return config_.constraint->AllowedBitmask(constraint_state_);
 }
 
+std::shared_ptr<const TokenBitmask> SamplerState::CachedConstraintBitmask()
+    const {
+  if (!config_.constraint || ForcedToken())
+    return nullptr;
+  return config_.constraint->LookupCachedBitmask(constraint_state_);
+}
+
 std::vector<float> SamplerState::ConstrainedLogits(
     std::span<const float> logits, std::span<const TokenId> ids) const {
   const auto mask = config_.constraint->Allowed(constraint_state_);

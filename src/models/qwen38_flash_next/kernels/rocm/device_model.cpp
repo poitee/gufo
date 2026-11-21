@@ -585,6 +585,45 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
                  "strix-q4k-mtp: %zu dense copies, %zu expert tensors, %zu MiB\n",
                  dense_copies, expert_tensors, total_bytes >> 20);
   }
+  if (const char* mtp_down = std::getenv("GUFO_STRIX_MTP_DOWN_IQ4");
+      m->has_mtp_ && mtp_down != nullptr && mtp_down[0] != '\0' &&
+      mtp_down[0] != '0') {
+    auto& t = m->mtp_.ffn_down_exps;
+    if (!t.empty() && t.cols % 32 == 0 && t.experts > 0 &&
+        (t.type == core::GgmlType::kQ8_0 || t.type == core::GgmlType::kQ5_1)) {
+      const std::size_t total_rows = std::size_t{t.experts} * t.rows;
+      const std::size_t old_block_bytes =
+          t.type == core::GgmlType::kQ8_0 ? 34 : 24;
+      const std::size_t old_alloc_bytes =
+          total_rows * (t.cols / 32) * old_block_bytes + kTailMargin;
+      const std::size_t dst_size = total_rows * (t.cols / 32) * 18;
+      void* dst = nullptr;
+      if (weights.Allocate(&dst, dst_size + kTailMargin) != hipSuccess) {
+        if (error_msg != nullptr)
+          *error_msg = "MTP down IQ4_NL conversion allocation failed";
+        return nullptr;
+      }
+      QuantizeExpsToIQ4NL(t.data, t.type, dst, total_rows, t.cols, nullptr);
+      (void)hipMemsetAsync(static_cast<std::uint8_t*>(dst) + dst_size, 0,
+                           kTailMargin, nullptr);
+      if (hipDeviceSynchronize() != hipSuccess) {
+        (void)hipFree(dst);
+        if (error_msg != nullptr)
+          *error_msg = "MTP down IQ4_NL conversion failed";
+        return nullptr;
+      }
+      void* old_ptr = t.data;
+      std::erase(m->allocations_, old_ptr);
+      (void)hipFree(old_ptr);
+      m->allocations_.push_back(dst);
+      m->bytes_ -= old_alloc_bytes;
+      m->bytes_ += dst_size + kTailMargin;
+      t.data = dst;
+      t.type = core::GgmlType::kIQ4_NL;
+      std::fprintf(stderr, "strix-mtp-down: IQ4_NL (saved %zu MiB)\n",
+                   (old_alloc_bytes - (dst_size + kTailMargin)) >> 20);
+    }
+  }
   if (const char* moe_down = std::getenv("GUFO_STRIX_MOE_DOWN");
       moe_down != nullptr && moe_down[0] != '\0' && moe_down[0] != '0') {
     const bool to_mxfp4 = std::strncmp(moe_down, "mxfp4", 5) == 0;
@@ -700,13 +739,14 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
           blk.qs[j] = static_cast<std::uint8_t>((idx * 17 + j * 31) & 0xFF);
       }
       // Exact Q8_1-representable inputs (block scale = 1/128 = 0x2000).
-      std::vector<float> h_x(std::size_t{T_max} * K);
+      std::vector<float> h_x(static_cast<std::size_t>(T_max) * K);
       for (int t = 0; t < T_max; ++t) {
         for (int b = 0; b < B; ++b) {
-          h_x[std::size_t{t} * K + b * 32 + 0] = 127.0f * 0.0078125f;
+          h_x[static_cast<std::size_t>(t) * K + b * 32 + 0] =
+              127.0f * 0.0078125f;
           for (int i = 1; i < 32; ++i) {
             const int q = ((i * 7 + b * 13 + t * 19) % 121) - 60;
-            h_x[std::size_t{t} * K + b * 32 + i] =
+            h_x[static_cast<std::size_t>(t) * K + b * 32 + i] =
                 static_cast<float>(q) * 0.0078125f;
           }
         }
@@ -771,7 +811,8 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
         const int type_id = static_cast<int>(
             mxfp4 ? core::GgmlType::kMXFP4 : core::GgmlType::kIQ4_NL);
         const void* w_dev = mxfp4 ? d_mx : d_iq4;
-        if (hipMemsetAsync(d_out, 0, std::size_t{tokens} * M * sizeof(float),
+        if (hipMemsetAsync(d_out, 0,
+                           static_cast<std::size_t>(tokens) * M * sizeof(float),
                            nullptr) != hipSuccess)
           return false;
         const int rc =
@@ -783,7 +824,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
                                   tokens, E, 1, nullptr);
         if (rc != 0)
           return false;
-        std::vector<float> h_out(std::size_t{tokens} * M);
+        std::vector<float> h_out(static_cast<std::size_t>(tokens) * M);
         if (hipMemcpyAsync(h_out.data(), d_out, h_out.size() * sizeof(float),
                            hipMemcpyDeviceToHost, nullptr) != hipSuccess ||
             hipDeviceSynchronize() != hipSuccess)
@@ -794,7 +835,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
             double ref = 0.0;
             for (int b = 0; b < B; ++b) {
               const int bidx = (e * M + r) * B + b;
-              const float* xp = &h_x[std::size_t{t} * K + b * 32];
+              const float* xp = &h_x[static_cast<std::size_t>(t) * K + b * 32];
               if (mxfp4) {
                 const auto& blk = h_mx[bidx];
                 const double scale =
@@ -817,7 +858,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
                 }
               }
             }
-            const float got = h_out[std::size_t{t} * M + r];
+            const float got = h_out[static_cast<std::size_t>(t) * M + r];
             if (!std::isfinite(got))
               return false;
             const double err =
@@ -848,6 +889,99 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       if (error_msg != nullptr)
         *error_msg = "MoE down 4-bit selftest failed";
       return nullptr;
+    }
+    if (!m->layers_.empty() &&
+        m->layers_[0].ffn_gate_exps.type == core::GgmlType::kQ4_K &&
+        m->layers_[0].ffn_up_exps.type == core::GgmlType::kQ4_K &&
+        m->layers_[0].ffn_gate_exps.experts > 0) {
+      const auto& g = m->layers_[0].ffn_gate_exps;
+      const auto& u = m->layers_[0].ffn_up_exps;
+      const int M = static_cast<int>(g.rows);
+      const int K = static_cast<int>(g.cols);
+      const int E = static_cast<int>(g.experts);
+      constexpr int T = 16;
+      const int U = static_cast<int>(m->config_.num_experts_used);
+      if (K % 256 == 0 && U > 0 && U <= 32) {
+        std::vector<float> h_x(static_cast<std::size_t>(T) * K);
+        for (int t = 0; t < T; ++t) {
+          for (int k = 0; k < K; ++k) {
+            const int v = ((k * 17 + t * 29 + 3) % 97) - 48;
+            h_x[static_cast<std::size_t>(t) * K + k] =
+                static_cast<float>(v) * 0.015625f;
+          }
+        }
+        std::vector<std::int32_t> h_ids(static_cast<std::size_t>(T) * U);
+        for (int t = 0; t < T; ++t) {
+          for (int j = 0; j < U; ++j) {
+            if (j == 0 && t < 10)
+              h_ids[static_cast<std::size_t>(t) * U + j] = 0;  // multi > 8
+            else if (j == 1 && t < 5)
+              h_ids[static_cast<std::size_t>(t) * U + j] = 3 % E;  // multi 5
+            else if (j == 2 && t < 2)
+              h_ids[static_cast<std::size_t>(t) * U + j] = 7 % E;  // multi 2
+            else if (t == T - 1 && j == U - 1)
+              h_ids[static_cast<std::size_t>(t) * U + j] = -1;     // sentinel
+            else
+              h_ids[static_cast<std::size_t>(t) * U + j] =
+                  (17 + t * U + j) % E;  // singletons
+          }
+        }
+        const std::size_t out_elems = static_cast<std::size_t>(T) * U * M;
+        float* d_x = nullptr;
+        std::int32_t* d_ids = nullptr;
+        float* d_ref = nullptr;
+        float* d_fast = nullptr;
+        const auto free_gu = [&]() {
+          if (d_x) (void)hipFree(d_x);
+          if (d_ids) (void)hipFree(d_ids);
+          if (d_ref) (void)hipFree(d_ref);
+          if (d_fast) (void)hipFree(d_fast);
+        };
+        bool gu_ok =
+            hip::AllocateDevice(&d_x, h_x.size() * sizeof(float)) == hipSuccess &&
+            hip::AllocateDevice(&d_ids, h_ids.size() * sizeof(std::int32_t)) ==
+                hipSuccess &&
+            hip::AllocateDevice(&d_ref, out_elems * sizeof(float)) ==
+                hipSuccess &&
+            hip::AllocateDevice(&d_fast, out_elems * sizeof(float)) ==
+                hipSuccess &&
+            hipMemcpyAsync(d_x, h_x.data(), h_x.size() * sizeof(float),
+                           hipMemcpyHostToDevice, nullptr) == hipSuccess &&
+            hipMemcpyAsync(d_ids, h_ids.data(),
+                           h_ids.size() * sizeof(std::int32_t),
+                           hipMemcpyHostToDevice, nullptr) == hipSuccess &&
+            qfn_mmq_moe_gu_selftest_compare(g.data, u.data, d_x, d_ids, d_ref,
+                                            d_fast, M, K, T, U, nullptr) == 0;
+        std::vector<float> h_ref(out_elems), h_fast(out_elems);
+        gu_ok = gu_ok &&
+                hipMemcpyAsync(h_ref.data(), d_ref, out_elems * sizeof(float),
+                               hipMemcpyDeviceToHost, nullptr) == hipSuccess &&
+                hipMemcpyAsync(h_fast.data(), d_fast, out_elems * sizeof(float),
+                               hipMemcpyDeviceToHost, nullptr) == hipSuccess &&
+                hipDeviceSynchronize() == hipSuccess;
+        free_gu();
+        double max_err = 0.0;
+        bool all_finite = true;
+        if (gu_ok) {
+          for (std::size_t i = 0; i < out_elems; ++i) {
+            if (!std::isfinite(h_ref[i]) || !std::isfinite(h_fast[i])) {
+              all_finite = false;
+              continue;
+            }
+            const double d = std::abs(static_cast<double>(h_ref[i]) -
+                                      static_cast<double>(h_fast[i]));
+            if (d > max_err)
+              max_err = d;
+          }
+        }
+        std::fprintf(stderr, "strix-moe-gu-selftest: tokens=%d max_err=%.3e\n",
+                     T, max_err);
+        if (!gu_ok || !all_finite || max_err >= 1e-5) {
+          if (error_msg != nullptr)
+            *error_msg = "MoE Wave32 gate/up selftest failed";
+          return nullptr;
+        }
+      }
     }
     const DeviceTensor* probe = nullptr;
     const DeviceTensor* hc_probe = nullptr;

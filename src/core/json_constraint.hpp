@@ -4,6 +4,7 @@
 #include <bitset>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -126,6 +127,8 @@ private:
   std::vector<Piece> pieces_;
   std::vector<std::uint32_t> next_token_;
   std::vector<std::uint32_t> reasoning_boundary_tokens_;
+  std::vector<std::uint32_t> raw_string_boundary_tokens_;
+  std::vector<std::uint32_t> json_string_boundary_tokens_;
   std::size_t max_token_bytes_{0};
 };
 
@@ -141,17 +144,24 @@ struct TokenConstraint {
       const JsonConstraint::State& state) const;
   [[nodiscard]] std::shared_ptr<const TokenBitmask> AllowedBitmask(
       const JsonConstraint::State& state) const;
+  [[nodiscard]] std::shared_ptr<const TokenBitmask> LookupCachedBitmask(
+      const JsonConstraint::State& state) const;
 
 private:
   struct MaskEntry {
     std::shared_ptr<const std::vector<std::uint8_t>> bytes;
     std::shared_ptr<const TokenBitmask> bits;
   };
+  struct CacheSlot {
+    MaskEntry entry;
+    std::list<JsonConstraint::State>::iterator lru;
+  };
   [[nodiscard]] MaskEntry LookupOrBuild(
       const JsonConstraint::State& state) const;
   mutable std::mutex mutex_;
   mutable JsonConstraint::State initial_state_;
-  mutable std::map<JsonConstraint::State, MaskEntry> masks_;
+  mutable std::list<JsonConstraint::State> lru_;
+  mutable std::map<JsonConstraint::State, CacheSlot> masks_;
 };
 
 }  // namespace gufo::sampling

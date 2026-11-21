@@ -4399,7 +4399,7 @@ bool Executor::SampledMtpCandidates(
       penalties.insert(penalties.end(), counts.begin(), counts.end());
       batch.offsets[row + 1] = penalties.size();
       if (constraint_alive && !tentative.ForcedToken()) {
-        if (const auto bm = tentative.ConstraintBitmask();
+        if (const auto bm = tentative.CachedConstraintBitmask();
             bm && bm->restricts) {
           auto* dst = verification_allowed_masks_host_ + row * mask_stride;
           const auto copy_words =

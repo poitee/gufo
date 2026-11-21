@@ -133,6 +133,8 @@ public:
   }
   [[nodiscard]] bool AllowsToken(TokenId token) const;
   [[nodiscard]] std::shared_ptr<const TokenBitmask> ConstraintBitmask() const;
+  [[nodiscard]] std::shared_ptr<const TokenBitmask> CachedConstraintBitmask()
+      const;
   [[nodiscard]] std::span<const TokenId> history() const noexcept;
   /// The token every sampling path returns next, if any: an exhausted
   /// reasoning budget forces its end sequence.
