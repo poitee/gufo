@@ -105,6 +105,7 @@ struct RoundProfState {
       finish{0};
   double fin_cand{0}, fin_ver{0}, fin_rb{0};
   int fin_fb{0};
+  int small_head_yes{0}, small_head_tot{0};
   double reqs{0}, rows{0}, steps{0};
 };
 
@@ -244,9 +245,10 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
-  if (m->mtp_weights_ && m->device_->output().rows > kMtpDraftVocab) {
+  const std::uint32_t draft_prefix = MtpDraftVocabPrefix();
+  if (m->mtp_weights_ && m->device_->output().rows > draft_prefix) {
     std::vector<std::int32_t> specials;
-    for (std::uint32_t id = kMtpDraftVocab; id < m->device_->output().rows;
+    for (std::uint32_t id = draft_prefix; id < m->device_->output().rows;
          ++id)
       if (m->tokenizer_->IsSpecialToken(id))
         specials.push_back(static_cast<std::int32_t>(id));
@@ -254,7 +256,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     // full head.
     if (specials.size() < kMtpDraftExtraRows) {
       m->draft_specials_ = static_cast<std::uint32_t>(specials.size());
-      if (!m->device_->SetDraftVocab(kMtpDraftVocab, std::move(specials),
+      if (!m->device_->SetDraftVocab(draft_prefix, std::move(specials),
                                      error_msg))
         return nullptr;
       m->draft_subset_ = true;
@@ -346,9 +348,10 @@ bool Model::HasMtp() const noexcept {
 }
 
 bool Model::InDraftSubset(std::int32_t token) const {
-  return token >= 0 && (static_cast<std::uint32_t>(token) < kMtpDraftVocab ||
-                        tokenizer_->IsSpecialToken(
-                            static_cast<tokenization::TokenId>(token)));
+  return token >= 0 &&
+         (static_cast<std::uint32_t>(token) < MtpDraftVocabPrefix() ||
+          tokenizer_->IsSpecialToken(
+              static_cast<tokenization::TokenId>(token)));
 }
 
 std::string Model::ModelName() const {
@@ -1848,6 +1851,15 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
     const auto t_end = std::chrono::steady_clock::now();
     p_finish = now_ms(t_f1, t_end);
     const double p_total = now_ms(cycle_start, t_end);
+    int p_sh_yes = 0;
+    int p_sh_tot = 0;
+    for (const auto& p : pending) {
+      if (p.speculative) {
+        ++p_sh_tot;
+        if (p.draft_subset)
+          ++p_sh_yes;
+      }
+    }
     std::lock_guard lock(rprof.mu);
     if (rprof.rounds < 25) {
       rprof.total += p_total;
@@ -1861,6 +1873,8 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
       rprof.fin_ver += fprof.ver;
       rprof.fin_rb += fprof.rb;
       rprof.fin_fb += fprof.fb;
+      rprof.small_head_yes += p_sh_yes;
+      rprof.small_head_tot += p_sh_tot;
       rprof.reqs += static_cast<double>(requests.size());
       rprof.rows += static_cast<double>(offset);
       rprof.steps += static_cast<double>(p_steps);
@@ -1872,12 +1886,13 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
             "strix-prof-round (n=25 avg_reqs=%.1f avg_rows=%.1f "
             "avg_steps=%.1f): total=%.1fms | prep=%.1f catchup=%.1f "
             "mtp_heads=%.1f mtp_bodies=%.1f fwd=%.1f finish=%.1f "
-            "(cand=%.1f ver=%.1f rb=%.1f fb=%d)\n",
+            "(cand=%.1f ver=%.1f rb=%.1f fb=%d) sh=%d/%d\n",
             rprof.reqs * inv, rprof.rows * inv, rprof.steps * inv,
             rprof.total * inv, rprof.prep * inv, rprof.catchup * inv,
             rprof.heads * inv, rprof.bodies * inv, rprof.fwd * inv,
             rprof.finish * inv, rprof.fin_cand * inv, rprof.fin_ver * inv,
-            rprof.fin_rb * inv, rprof.fin_fb);
+            rprof.fin_rb * inv, rprof.fin_fb, rprof.small_head_yes,
+            rprof.small_head_tot);
       }
     }
   }

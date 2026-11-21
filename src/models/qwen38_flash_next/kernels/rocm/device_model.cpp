@@ -1,6 +1,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 
 #include <algorithm>
 #include <cassert>
@@ -10,6 +11,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <utility>
+#include <vector>
 
 #include "src/core/hip/managed_alloc.hpp"
 #include "src/core/hip/weight_upload.hpp"
@@ -26,6 +28,14 @@ namespace {
 /// over-read stays inside the allocation (the extra bytes meet zeroed
 /// activation padding and contribute nothing).
 constexpr std::size_t kTailMargin = 4096;
+
+bool HwBenchEnabled() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("GUFO_STRIX_HW_BENCH");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
 
 struct Conversion {
   void* source;
@@ -372,6 +382,76 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
     draft_output_.q4k = q4k;
     std::fprintf(stderr, "strix-q4k-draft: %u rows, %zu MiB\n", prefix_rows,
                  size >> 20);
+  }
+  if (HwBenchEnabled() && draft_output_.q4k != nullptr &&
+      draft_output_.cols >= 256 && draft_output_.cols % 256 == 0) {
+    const int K = static_cast<int>(draft_output_.cols);
+    const std::size_t q8_bytes = qfn_mmq_q8_1_bytes(3, K);
+    float* d_x = nullptr;
+    void* d_q8 = nullptr;
+    float* d_out = nullptr;
+    if (hip::AllocateDevice(&d_x, std::size_t{3} * K * sizeof(float)) ==
+            hipSuccess &&
+        hip::AllocateDevice(&d_q8, q8_bytes) == hipSuccess &&
+        hip::AllocateDevice(&d_out, std::size_t{3} * prefix_rows *
+                                        sizeof(float)) == hipSuccess) {
+      std::vector<float> h_x(std::size_t{3} * K, 0.01f);
+      for (std::size_t i = 0; i < h_x.size(); ++i)
+        h_x[i] = static_cast<float>((i % 31) - 15) * 0.015625f;
+      if (hipMemcpyAsync(d_x, h_x.data(), h_x.size() * sizeof(float),
+                         hipMemcpyHostToDevice, nullptr) == hipSuccess &&
+          qfn_mmq_quantize_q8_1(d_x, d_q8, 3, K, nullptr) == 0 &&
+          hipDeviceSynchronize() == hipSuccess) {
+        hipEvent_t e0 = nullptr, e1 = nullptr;
+        if (hipEventCreate(&e0) == hipSuccess &&
+            hipEventCreate(&e1) == hipSuccess) {
+          std::vector<std::uint32_t> row_counts;
+          for (std::uint32_t r : {32768U, 49152U, 65536U, prefix_rows}) {
+            if (r <= prefix_rows &&
+                std::find(row_counts.begin(), row_counts.end(), r) ==
+                    row_counts.end())
+              row_counts.push_back(r);
+          }
+          for (std::uint32_t R : row_counts) {
+            const double bytes =
+                static_cast<double>(R) * (K / 256) * 144.0;
+            for (int M : {1, 2, 3}) {
+              for (int w = 0; w < 3; ++w)
+                (void)qfn_mmq_q4_K_dense_vec_preq(
+                    draft_output_.q4k, nullptr, d_q8, d_out,
+                    static_cast<int>(R), M, K, nullptr);
+              float t[10]{};
+              bool ok = true;
+              for (int i = 0; i < 10; ++i) {
+                ok = ok && hipEventRecord(e0, nullptr) == hipSuccess &&
+                     qfn_mmq_q4_K_dense_vec_preq(
+                         draft_output_.q4k, nullptr, d_q8, d_out,
+                         static_cast<int>(R), M, K, nullptr) == 0 &&
+                     hipEventRecord(e1, nullptr) == hipSuccess &&
+                     hipEventSynchronize(e1) == hipSuccess &&
+                     hipEventElapsedTime(&t[i], e0, e1) == hipSuccess;
+              }
+              if (ok) {
+                std::sort(t, t + 10);
+                const double med = 0.5 * (t[4] + t[5]);
+                const double gbs = med > 0.0 ? bytes / (med * 1e-3) / 1e9 : 0.0;
+                std::fprintf(
+                    stderr,
+                    "strix-hw-bench: q4k_draft rows=%u M=%d ms=%.3f gbs=%.1f\n",
+                    R, M, med, gbs);
+              }
+            }
+          }
+        }
+        if (e0) (void)hipEventDestroy(e0);
+        if (e1) (void)hipEventDestroy(e1);
+      }
+    } else {
+      (void)hipGetLastError();
+    }
+    if (d_x) (void)hipFree(d_x);
+    if (d_q8) (void)hipFree(d_q8);
+    if (d_out) (void)hipFree(d_out);
   }
   draft_specials_ = std::move(specials);
   return true;
@@ -1022,6 +1102,182 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       if (error_msg != nullptr)
         *error_msg = "Q4_K HC down split-K WMMA selftest failed";
       return nullptr;
+    }
+  }
+  if (HwBenchEnabled()) {
+    hipEvent_t e0 = nullptr, e1 = nullptr;
+    if (hipEventCreate(&e0) == hipSuccess &&
+        hipEventCreate(&e1) == hipSuccess) {
+      // 1) 128 MiB D2D copy bandwidth (reads + writes = 256 MiB per copy)
+      constexpr std::size_t kCopyBytes = std::size_t{128} << 20;
+      void* d_src = nullptr;
+      void* d_dst = nullptr;
+      if (hip::AllocateDevice(&d_src, kCopyBytes) == hipSuccess &&
+          hip::AllocateDevice(&d_dst, kCopyBytes) == hipSuccess) {
+        (void)hipMemsetAsync(d_src, 0x5A, kCopyBytes, nullptr);
+        (void)hipMemsetAsync(d_dst, 0x00, kCopyBytes, nullptr);
+        (void)hipDeviceSynchronize();
+        for (int w = 0; w < 3; ++w)
+          (void)hipMemcpyAsync(d_dst, d_src, kCopyBytes,
+                               hipMemcpyDeviceToDevice, nullptr);
+        (void)hipDeviceSynchronize();
+        float t[10]{};
+        bool ok = true;
+        for (int i = 0; i < 10; ++i) {
+          ok = ok && hipEventRecord(e0, nullptr) == hipSuccess &&
+               hipMemcpyAsync(d_dst, d_src, kCopyBytes,
+                              hipMemcpyDeviceToDevice, nullptr) == hipSuccess &&
+               hipEventRecord(e1, nullptr) == hipSuccess &&
+               hipEventSynchronize(e1) == hipSuccess &&
+               hipEventElapsedTime(&t[i], e0, e1) == hipSuccess;
+        }
+        if (ok) {
+          std::sort(t, t + 10);
+          const double med = 0.5 * (t[4] + t[5]);
+          const double gbs =
+              med > 0.0 ? (2.0 * static_cast<double>(kCopyBytes)) /
+                              (med * 1e-3) / 1e9
+                        : 0.0;
+          std::fprintf(stderr,
+                       "strix-hw-bench: copy_128MiB_ms=%.3f copy_gbs=%.1f\n",
+                       med, gbs);
+        }
+      } else {
+        (void)hipGetLastError();
+        std::fprintf(stderr, "strix-hw-bench: copy alloc skipped\n");
+      }
+      if (d_src) (void)hipFree(d_src);
+      if (d_dst) (void)hipFree(d_dst);
+
+      // 2) FP16 square GEMM throughput (4096^3 and 8192^3)
+      hipblasHandle_t blas = nullptr;
+      if (hipblasCreate(&blas) == HIPBLAS_STATUS_SUCCESS) {
+        for (int N : {4096, 8192}) {
+          const std::size_t bytes = std::size_t{N} * N * 2;
+          void* dA = nullptr;
+          void* dB = nullptr;
+          void* dC = nullptr;
+          if (hip::AllocateDevice(&dA, bytes) == hipSuccess &&
+              hip::AllocateDevice(&dB, bytes) == hipSuccess &&
+              hip::AllocateDevice(&dC, bytes) == hipSuccess) {
+            (void)hipMemsetAsync(dA, 0, bytes, nullptr);
+            (void)hipMemsetAsync(dB, 0, bytes, nullptr);
+            (void)hipMemsetAsync(dC, 0, bytes, nullptr);
+            (void)hipDeviceSynchronize();
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            bool ok = true;
+            for (int w = 0; w < 2; ++w) {
+              ok = ok &&
+                   hipblasGemmEx(blas, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+                                 &alpha, dA, HIP_R_16F, N, dB, HIP_R_16F, N,
+                                 &beta, dC, HIP_R_16F, N, HIPBLAS_COMPUTE_32F,
+                                 HIPBLAS_GEMM_DEFAULT) ==
+                       HIPBLAS_STATUS_SUCCESS;
+            }
+            (void)hipDeviceSynchronize();
+            float t[5]{};
+            for (int i = 0; i < 5 && ok; ++i) {
+              ok = ok && hipEventRecord(e0, nullptr) == hipSuccess &&
+                   hipblasGemmEx(blas, HIPBLAS_OP_N, HIPBLAS_OP_N, N, N, N,
+                                 &alpha, dA, HIP_R_16F, N, dB, HIP_R_16F, N,
+                                 &beta, dC, HIP_R_16F, N, HIPBLAS_COMPUTE_32F,
+                                 HIPBLAS_GEMM_DEFAULT) ==
+                       HIPBLAS_STATUS_SUCCESS &&
+                   hipEventRecord(e1, nullptr) == hipSuccess &&
+                   hipEventSynchronize(e1) == hipSuccess &&
+                   hipEventElapsedTime(&t[i], e0, e1) == hipSuccess;
+            }
+            if (ok) {
+              std::sort(t, t + 5);
+              const double med = static_cast<double>(t[2]);
+              const double flops = 2.0 * N * N * N;
+              const double tflops =
+                  med > 0.0 ? flops / (med * 1e-3) / 1e12 : 0.0;
+              std::fprintf(stderr,
+                           "strix-hw-bench: gemm_fp16_N=%d ms=%.3f tflops=%.2f\n",
+                           N, med, tflops);
+            }
+          } else {
+            (void)hipGetLastError();
+            std::fprintf(stderr, "strix-hw-bench: gemm_fp16_N=%d alloc skipped\n",
+                         N);
+          }
+          if (dA) (void)hipFree(dA);
+          if (dB) (void)hipFree(dB);
+          if (dC) (void)hipFree(dC);
+        }
+        (void)hipblasDestroy(blas);
+      }
+    }
+    if (e0) (void)hipEventDestroy(e0);
+    if (e1) (void)hipEventDestroy(e1);
+
+    // 3) Realistic correlated MoE gate+up Q4_K wave64 vs wave32 microbench
+    if (!m->layers_.empty() &&
+        m->layers_[0].ffn_gate_exps.type == core::GgmlType::kQ4_K &&
+        m->layers_[0].ffn_up_exps.type == core::GgmlType::kQ4_K &&
+        m->layers_[0].ffn_gate_exps.experts > 0) {
+      const auto& g = m->layers_[0].ffn_gate_exps;
+      const auto& u = m->layers_[0].ffn_up_exps;
+      const int M = static_cast<int>(g.rows);
+      const int K = static_cast<int>(g.cols);
+      const int E = static_cast<int>(g.experts);
+      const int U = static_cast<int>(m->config_.num_experts_used);
+      if (K % 256 == 0 && U > 0 && U <= 32) {
+        for (int T : {12, 16}) {
+          std::vector<float> h_x(std::size_t{T} * K);
+          for (std::size_t i = 0; i < h_x.size(); ++i)
+            h_x[i] = static_cast<float>((i % 37) - 18) * 0.015625f;
+          std::vector<std::int32_t> h_ids(std::size_t{T} * U);
+          std::vector<std::uint8_t> seen(E, 0);
+          int uniq = 0;
+          const int pool_span = std::min(E, 72);
+          for (int t = 0; t < T; ++t) {
+            for (int j = 0; j < U; ++j) {
+              const int e =
+                  (((t * 7 + j * 13) % pool_span) + (t / 4) * 18) % E;
+              h_ids[std::size_t{t} * U + j] = e;
+              if (!seen[e]) {
+                seen[e] = 1;
+                ++uniq;
+              }
+            }
+          }
+          float* d_x = nullptr;
+          std::int32_t* d_ids = nullptr;
+          float* d_out = nullptr;
+          const std::size_t out_elems = std::size_t{T} * U * M;
+          if (hip::AllocateDevice(&d_x, h_x.size() * sizeof(float)) ==
+                  hipSuccess &&
+              hip::AllocateDevice(&d_ids, h_ids.size() * sizeof(std::int32_t)) ==
+                  hipSuccess &&
+              hip::AllocateDevice(&d_out, out_elems * sizeof(float)) ==
+                  hipSuccess) {
+            float w64_ms = 0.0f, w32_ms = 0.0f;
+            if (hipMemcpyAsync(d_x, h_x.data(), h_x.size() * sizeof(float),
+                               hipMemcpyHostToDevice, nullptr) == hipSuccess &&
+                hipMemcpyAsync(d_ids, h_ids.data(),
+                               h_ids.size() * sizeof(std::int32_t),
+                               hipMemcpyHostToDevice, nullptr) == hipSuccess &&
+                hipDeviceSynchronize() == hipSuccess &&
+                qfn_mmq_moe_gu_bench(g.data, u.data, d_x, d_ids, d_out, M, K, T,
+                                     U, &w64_ms, &w32_ms, nullptr) == 0) {
+              const double spd = w32_ms > 0.0f ? w64_ms / w32_ms : 0.0;
+              std::fprintf(
+                  stderr,
+                  "strix-hw-bench: moe_gu_T=%d uniq=%d w64_ms=%.3f "
+                  "w32_ms=%.3f speedup=%.3fx\n",
+                  T, uniq, w64_ms, w32_ms, spd);
+            }
+          } else {
+            (void)hipGetLastError();
+          }
+          if (d_x) (void)hipFree(d_x);
+          if (d_ids) (void)hipFree(d_ids);
+          if (d_out) (void)hipFree(d_out);
+        }
+      }
     }
   }
   return m;

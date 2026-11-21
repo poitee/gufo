@@ -63,10 +63,14 @@ constexpr int kProfLimit = 25;
 struct FwdProfState {
   std::mutex mu;
   std::vector<hipEvent_t> events;
+  std::int32_t* ids_dev{nullptr};
+  std::size_t ids_cap{0};
   int rounds{0};
   double total_rows{0};
   double hc{0}, qkv{0}, gdn{0}, attn{0}, out_proj{0}, router{0}, shexp{0},
       moe_gu{0}, moe_dn{0}, comb{0}, lm{0}, other{0}, total{0};
+  double uniq_exp{0}, multi_exp{0}, single_exp{0};
+  int exp_layers{0};
 };
 
 FwdProfState& GetFwdProf() {
@@ -79,6 +83,9 @@ struct FwdPassEvents {
   std::vector<hipEvent_t>* ev{nullptr};
   int count{0};
   hipStream_t stream{nullptr};
+  std::int32_t* ids_dev{nullptr};
+  std::uint32_t ids_stride{0};
+  std::uint32_t num_experts{0};
   struct LayerMarks {
     bool linear{false};
     bool reuse_q8{false};
@@ -1093,6 +1100,13 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
                 c.num_experts_used, c.hidden_size, stream_);
     if (prof)
       (void)prof->Mark();
+    if (prof && prof->active && prof->ids_dev != nullptr && li < 64 &&
+        prof->ids_stride >= rows * c.num_experts_used) {
+      (void)hipMemcpyAsync(
+          prof->ids_dev + std::size_t{li} * prof->ids_stride, base.ids,
+          std::size_t{rows} * c.num_experts_used * sizeof(std::int32_t),
+          hipMemcpyDeviceToDevice, stream_);
+    }
     return true;
   }
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
@@ -1106,6 +1120,13 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   }
   if (prof)
     (void)prof->Mark();
+  if (prof && prof->active && prof->ids_dev != nullptr && li < 64 &&
+      prof->ids_stride >= rows * c.num_experts_used) {
+    (void)hipMemcpyAsync(
+        prof->ids_dev + std::size_t{li} * prof->ids_stride, base.ids,
+        std::size_t{rows} * c.num_experts_used * sizeof(std::int32_t),
+        hipMemcpyDeviceToDevice, stream_);
+  }
   return true;
 }
 
@@ -1252,9 +1273,30 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     if (max_pos >= 4096) {
       prof_lock.lock();
       if (prof_state.rounds < kProfLimit) {
+        const std::size_t ids_stride =
+            std::size_t{rows} * c.num_experts_used;
+        const std::size_t need_ints = std::size_t{c.num_layers} * ids_stride;
+        if (need_ints > prof_state.ids_cap) {
+          if (prof_state.ids_dev != nullptr) {
+            (void)hipFree(prof_state.ids_dev);
+            prof_state.ids_dev = nullptr;
+            prof_state.ids_cap = 0;
+          }
+          std::int32_t* ptr = nullptr;
+          if (hip::AllocateDevice(&ptr, need_ints * sizeof(std::int32_t)) ==
+              hipSuccess) {
+            prof_state.ids_dev = ptr;
+            prof_state.ids_cap = need_ints;
+          } else {
+            (void)hipGetLastError();
+          }
+        }
         prof.active = true;
         prof.ev = &prof_state.events;
         prof.stream = stream_;
+        prof.ids_dev = prof_state.ids_dev;
+        prof.ids_stride = static_cast<std::uint32_t>(ids_stride);
+        prof.num_experts = c.num_experts;
       } else {
         prof_lock.unlock();
       }
@@ -1624,21 +1666,60 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       prof_state.lm += span_ms(prof.head_base + 1, prof.head_base + 2);
       prof_state.total += span_ms(0, prof.head_base + 2);
       prof_state.total_rows += rows;
+      if (prof.ids_dev != nullptr && prof.ids_stride > 0 &&
+          prof.num_experts > 0) {
+        const std::size_t total_ints =
+            std::size_t{n_layers} * prof.ids_stride;
+        std::vector<std::int32_t> h_ids(total_ints);
+        if (hipMemcpy(h_ids.data(), prof.ids_dev,
+                      total_ints * sizeof(std::int32_t),
+                      hipMemcpyDeviceToHost) == hipSuccess) {
+          std::vector<std::uint16_t> counts(prof.num_experts);
+          for (int il = 0; il < n_layers; ++il) {
+            std::fill(counts.begin(), counts.end(), 0);
+            const std::int32_t* p =
+                h_ids.data() + std::size_t{il} * prof.ids_stride;
+            for (std::uint32_t k = 0; k < prof.ids_stride; ++k) {
+              const std::int32_t e = p[k];
+              if (e >= 0 && static_cast<std::uint32_t>(e) < prof.num_experts)
+                ++counts[static_cast<std::size_t>(e)];
+            }
+            int u = 0, m = 0, s1 = 0;
+            for (std::uint32_t e = 0; e < prof.num_experts; ++e) {
+              if (counts[e] >= 1) {
+                ++u;
+                if (counts[e] >= 2)
+                  ++m;
+                else
+                  ++s1;
+              }
+            }
+            prof_state.uniq_exp += u;
+            prof_state.multi_exp += m;
+            prof_state.single_exp += s1;
+            ++prof_state.exp_layers;
+          }
+        }
+      }
       ++prof_state.rounds;
       if (prof_state.rounds == kProfLimit) {
         const double inv = 1.0 / kProfLimit;
+        const double inv_el =
+            prof_state.exp_layers > 0 ? 1.0 / prof_state.exp_layers : 0.0;
         std::fprintf(
             stderr,
             "strix-prof-fwd (n=%d avg_rows=%.1f): total=%.1fms | hc=%.1f "
             "qkv=%.1f gdn=%.1f attn=%.1f out=%.1f router=%.1f shexp=%.1f "
-            "moe_gu=%.1f moe_dn=%.1f comb=%.1f lm=%.1f other=%.1f\n",
+            "moe_gu=%.1f moe_dn=%.1f comb=%.1f lm=%.1f other=%.1f | "
+            "uniq=%.1f (multi=%.1f single=%.1f)\n",
             kProfLimit, prof_state.total_rows * inv, prof_state.total * inv,
             prof_state.hc * inv, prof_state.qkv * inv, prof_state.gdn * inv,
             prof_state.attn * inv, prof_state.out_proj * inv,
             prof_state.router * inv, prof_state.shexp * inv,
             prof_state.moe_gu * inv, prof_state.moe_dn * inv,
             prof_state.comb * inv, prof_state.lm * inv,
-            prof_state.other * inv);
+            prof_state.other * inv, prof_state.uniq_exp * inv_el,
+            prof_state.multi_exp * inv_el, prof_state.single_exp * inv_el);
       }
     }
   }

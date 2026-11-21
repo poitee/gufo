@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <vector>
@@ -23,6 +24,27 @@ namespace gufo::models::qwen38_flash_next {
 /// full vocabulary, so greedy output is unchanged. Sampled proposals are
 /// corrected against the distribution they were drawn from.
 inline constexpr std::uint32_t kMtpDraftVocab = 98304;
+
+/// Parses a runtime override prefix size (`GUFO_STRIX_DRAFT_VOCAB`), falling back
+/// to `kMtpDraftVocab` if unset, non-numeric, unaligned to 256 rows, or outside
+/// [4096, 240000].
+[[nodiscard]] inline std::uint32_t ParseMtpDraftVocabPrefix(
+    const char* v) noexcept {
+  if (v == nullptr || v[0] < '0' || v[0] > '9')
+    return kMtpDraftVocab;
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(v, &end, 10);
+  if (end == v || *end != '\0' || parsed < 4096UL || parsed > 240000UL ||
+      (parsed % 256UL) != 0)
+    return kMtpDraftVocab;
+  return static_cast<std::uint32_t>(parsed);
+}
+
+[[nodiscard]] inline std::uint32_t MtpDraftVocabPrefix() noexcept {
+  static const std::uint32_t prefix =
+      ParseMtpDraftVocabPrefix(std::getenv("GUFO_STRIX_DRAFT_VOCAB"));
+  return prefix;
+}
 
 /// Rows of the per-request table: the special tokens, then the request's own
 /// tokens above kMtpDraftVocab in first-use order.

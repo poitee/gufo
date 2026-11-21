@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // HIP adapters for the llama.cpp-derived quantized kernels. See VENDOR.md.
 #include "qfn_mmq_prelude.h"
+#include <algorithm>
 namespace qfn_mmq {
 #include "qfn_mmq.h"
 #include "common.hpp"
@@ -1107,6 +1108,96 @@ extern "C" int qfn_mmq_moe_gu_selftest_compare(
   mul_mat_vec_moe_batch_wave32_split(gate, up, q8, groups, out_fast, K, M,
                                      n_tokens, n_experts_used, input_stride,
                                      stream);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+extern "C" int qfn_mmq_moe_gu_bench(
+    const void* gate, const void* up, const float* X_f32, const int32_t* ids,
+    float* out_buf, int M, int K, int n_tokens, int n_experts_used,
+    float* ref_ms_out, float* fast_ms_out, hipStream_t stream) {
+  if (!gate || !up || !X_f32 || !ids || !out_buf || !ref_ms_out ||
+      !fast_ms_out || M <= 0 || K <= 0 || K % QK_K != 0 ||
+      n_tokens <= MMVQ_MAX_BATCH_SIZE || n_tokens > MMVQ_MAX_ROUTED_BATCH ||
+      n_experts_used <= 0 || n_experts_used > 32)
+    return -1;
+  const int dev = ggml_hip_get_device();
+  ggml_backend_hip_context* ctx = get_ctx_for_device(dev);
+  if (!ctx)
+    return -1;
+  const int64_t ne10_padded =
+      GGML_PAD(static_cast<int64_t>(K), MATRIX_ROW_PADDING);
+  const int input_stride = static_cast<int>(ne10_padded / QK8_1);
+  const size_t q8_bytes =
+      static_cast<size_t>(n_tokens) * ne10_padded * sizeof(block_q8_1) / QK8_1;
+  const size_t group_bytes =
+      2 * sizeof(int32_t) +
+      2 * static_cast<size_t>(n_tokens) * n_experts_used * sizeof(MoeBatchGroup);
+  ggml_hip_pool_alloc<char> pool;
+  pool.alloc(qfn_pool_for_stream(ctx->device, stream), q8_bytes + group_bytes);
+  char* ptr = pool.get();
+  if (!ptr)
+    return -1;
+  auto* q8 = reinterpret_cast<block_q8_1*>(ptr);
+  auto* groups = reinterpret_cast<int32_t*>(ptr + q8_bytes);
+  quantize_row_q8_1_hip(X_f32, nullptr, q8, GGML_TYPE_Q4_K, K,
+                        static_cast<int64_t>(K), static_cast<int64_t>(K),
+                        static_cast<int64_t>(K) * n_tokens, ne10_padded, 1,
+                        n_tokens, 1, stream);
+  if (hipMemsetAsync(groups, 0, 2 * sizeof(int32_t), stream) != hipSuccess)
+    return -2;
+  group_moe_batch_split_launch(ids, groups, n_tokens, n_experts_used, stream);
+  if (hipStreamSynchronize(stream) != hipSuccess)
+    return -3;
+  hipEvent_t e0 = nullptr, e1 = nullptr;
+  if (hipEventCreate(&e0) != hipSuccess || hipEventCreate(&e1) != hipSuccess) {
+    if (e0) (void)hipEventDestroy(e0);
+    if (e1) (void)hipEventDestroy(e1);
+    return -3;
+  }
+  constexpr int kWarm = 3;
+  constexpr int kIter = 10;
+  float ref_t[kIter]{};
+  float fast_t[kIter]{};
+  for (int i = 0; i < kWarm; ++i)
+    mul_mat_vec_moe_batch_wave64_split_ref(gate, up, q8, groups, out_buf, K, M,
+                                           n_tokens, n_experts_used,
+                                           input_stride, stream);
+  for (int i = 0; i < kIter; ++i) {
+    if (hipEventRecord(e0, stream) != hipSuccess) break;
+    mul_mat_vec_moe_batch_wave64_split_ref(gate, up, q8, groups, out_buf, K, M,
+                                           n_tokens, n_experts_used,
+                                           input_stride, stream);
+    if (hipEventRecord(e1, stream) != hipSuccess ||
+        hipEventSynchronize(e1) != hipSuccess ||
+        hipEventElapsedTime(&ref_t[i], e0, e1) != hipSuccess) {
+      (void)hipEventDestroy(e0);
+      (void)hipEventDestroy(e1);
+      return -3;
+    }
+  }
+  for (int i = 0; i < kWarm; ++i)
+    mul_mat_vec_moe_batch_wave32_split(gate, up, q8, groups, out_buf, K, M,
+                                       n_tokens, n_experts_used, input_stride,
+                                       stream);
+  for (int i = 0; i < kIter; ++i) {
+    if (hipEventRecord(e0, stream) != hipSuccess) break;
+    mul_mat_vec_moe_batch_wave32_split(gate, up, q8, groups, out_buf, K, M,
+                                       n_tokens, n_experts_used, input_stride,
+                                       stream);
+    if (hipEventRecord(e1, stream) != hipSuccess ||
+        hipEventSynchronize(e1) != hipSuccess ||
+        hipEventElapsedTime(&fast_t[i], e0, e1) != hipSuccess) {
+      (void)hipEventDestroy(e0);
+      (void)hipEventDestroy(e1);
+      return -3;
+    }
+  }
+  (void)hipEventDestroy(e0);
+  (void)hipEventDestroy(e1);
+  std::sort(ref_t, ref_t + kIter);
+  std::sort(fast_t, fast_t + kIter);
+  *ref_ms_out = 0.5f * (ref_t[kIter / 2 - 1] + ref_t[kIter / 2]);
+  *fast_ms_out = 0.5f * (fast_t[kIter / 2 - 1] + fast_t[kIter / 2]);
   return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(

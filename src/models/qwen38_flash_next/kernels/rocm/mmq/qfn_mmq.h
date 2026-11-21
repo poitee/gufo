@@ -56,6 +56,11 @@ int qfn_mmq_moe_gu_selftest_compare(const void* gate, const void* up,
                                     int K, int n_tokens, int n_experts_used,
                                     hipStream_t stream);
 
+int qfn_mmq_moe_gu_bench(const void* gate, const void* up, const float* X_f32,
+                         const int32_t* ids, float* out_buf, int M, int K,
+                         int n_tokens, int n_experts_used, float* ref_ms_out,
+                         float* fast_ms_out, hipStream_t stream);
+
 // qfn_mmq_moe_vec over a caller-quantized Q8_1 input (local experiment).
 int qfn_mmq_moe_vec_preq(int weight_type, const void* W, const void* X_q8,
                          const int32_t* ids, float* out, int M, int K,

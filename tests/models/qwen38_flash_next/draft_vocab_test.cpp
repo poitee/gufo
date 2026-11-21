@@ -104,6 +104,15 @@ void CheckEligibility() {
   }
 }
 
+void CheckPrefixParsing() {
+  Require(qfn::ParseMtpDraftVocabPrefix(nullptr) == 98304, "null prefix");
+  Require(qfn::ParseMtpDraftVocabPrefix("49152") == 49152, "49152 prefix");
+  Require(qfn::ParseMtpDraftVocabPrefix("32768") == 32768, "32768 prefix");
+  for (const char* bad : {"", "0", "100", "4097", "300000", "abc", "-32768"}) {
+    Require(qfn::ParseMtpDraftVocabPrefix(bad) == 98304, "invalid prefix");
+  }
+}
+
 int main() {
   try {
     CheckCommonText();
@@ -111,6 +120,7 @@ int main() {
     CheckCapacity();
     CheckReset();
     CheckEligibility();
+    CheckPrefixParsing();
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;
